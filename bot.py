@@ -408,7 +408,7 @@ async def download_media_group(
 
         db.update_download_source_last_message(source_row["id"], prepared_group.last_message_id)
         logger.info(
-            f"下载完成: source={source_row['id']} date={prepared_group.date_str} seq={prepared_group.seq:03d} last={prepared_group.last_message_id}"
+            f"下载完成: source={source_row['id']} date={prepared_group.date_str} id={prepared_group.seq} last={prepared_group.last_message_id}"
         )
 
         if cfg.rclone_enabled and prepared_group.remote_dir:
@@ -469,6 +469,9 @@ def _prepare_download_group(
     topic_root_message_id = source_row.get("topic_id") or source_row.get("topic_root_message_id")
     grouped_id = getattr(messages[0], "grouped_id", None)
 
+    folder_id = int(min(int(m.id) for m in messages))
+    preferred_folder = f"TG@BieLaoZai_{folder_id}"
+
     group_uid = build_group_uid(chat_id, topic_root_message_id, grouped_id, messages[0].id)
     existing = db.get_download_group(int(source_row["id"]), str(group_uid))
     if existing:
@@ -493,10 +496,10 @@ def _prepare_download_group(
         if not date_str:
             date_str = extract_date_yyyy_mm_dd(text_for_date, messages[0].date)
 
-        if seq <= 0:
-            seq = db.get_next_download_seq(source_row["id"], date_str)
+        if seq <= 0 or local_dir is None:
+            seq = folder_id
 
-        group_folder = local_dir.name if local_dir else f"TG@BieLaoZai_{seq:03d}"
+        group_folder = local_dir.name if local_dir else preferred_folder
 
         source_title = sanitize_path_component(source_row.get("display_title") or f"chat_{abs(chat_id)}")
         if local_dir is None:
@@ -538,8 +541,8 @@ def _prepare_download_group(
     text_for_date = header_text or _pick_text_for_date(messages)
     date_str = extract_date_yyyy_mm_dd(text_for_date, messages[0].date)
 
-    seq = db.get_next_download_seq(source_row["id"], date_str)
-    group_folder = f"TG@BieLaoZai_{seq:03d}"
+    seq = folder_id
+    group_folder = preferred_folder
 
     source_title = sanitize_path_component(source_row.get("display_title") or f"chat_{abs(chat_id)}")
     local_dir = cfg.download_root_dir / source_title / date_str / group_folder

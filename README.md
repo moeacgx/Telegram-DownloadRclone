@@ -105,12 +105,12 @@ python bot.py --backfill
 <DOWNLOAD_ROOT_DIR>/
   <来源标题>/
     2024-12-22/
-      TG@BieLaoZai_001/
-      TG@BieLaoZai_002/
+      TG@BieLaoZai_7304/
+      TG@BieLaoZai_7310/
 ```
 
 - `YYYY-MM-DD` 优先从消息文本中提取 `YYYY年MM月DD日`，否则使用消息发送日期。
-- `TG@BieLaoZai_001` 的前缀固定为 `TG@BieLaoZai`，序号按“来源+日期”递增。
+- `TG@BieLaoZai_<id>` 的前缀固定为 `TG@BieLaoZai`，`id` 为该媒体组中最小的消息 ID（便于从指定 ID 计算/定位，重启也不会“目录编号一直冲下去”）。
 
 ## rclone 上传与自动删除
 
