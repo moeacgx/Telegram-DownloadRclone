@@ -33,7 +33,7 @@ except ImportError:
     socks = None
 
 from telethon import TelegramClient, events, functions, Button
-from telethon.errors.rpcerrorlist import MessageNotModifiedError
+from telethon.errors.rpcerrorlist import MessageNotModifiedError, ReplyMarkupInvalidError
 
 from database import Database
 from bot import DownloaderRuntime, load_config as load_downloader_config
@@ -261,15 +261,33 @@ def _topic_selection_buttons(state: PendingTopicSelection, page_size: int) -> Li
     return rows
 
 
-def generate_source_list_message(db: Database, runtime: DownloaderRuntime) -> tuple[str, List[List[Button]]]:
+def generate_source_list_message(
+    db: Database,
+    runtime: DownloaderRuntime,
+    page: int = 0,
+    page_size: int = 8,
+) -> tuple[str, List[List[Button]]]:
     sources = db.list_download_sources(active_only=False)
     if not sources:
         return "📭 还没有添加任何频道/话题。\n\n使用“添加频道 / 添加群话题”开始。", []
 
-    text_lines: List[str] = ["📋 频道/话题列表\n"]
+    page_size = max(3, min(12, int(page_size or 8)))
+    total = len(sources)
+    pages = max(1, (total + page_size - 1) // page_size)
+    page = int(page or 0)
+    if page < 0:
+        page = 0
+    if page > pages - 1:
+        page = pages - 1
+
+    start = page * page_size
+    end = min(total, start + page_size)
+    sources_page = sources[start:end]
+
+    text_lines: List[str] = [f"📋 频道/话题列表（{page + 1}/{pages}）\n"]
     buttons: List[List[Button]] = []
 
-    for source in sources:
+    for source in sources_page:
         source_id = int(source["id"])
         title = str(source.get("display_title") or f"source_{source_id}")
         status_icon = "✅" if source.get("is_active") else "⏸️"
@@ -304,7 +322,9 @@ def generate_source_list_message(db: Database, runtime: DownloaderRuntime) -> tu
         )
 
         toggle_label = "⏸️ 暂停监听" if source.get("is_active") else "▶️ 开始监听"
-        buttons.append([Button.inline(f"{status_icon} { _truncate_button_text(title, 40)}", f"src:noop:{source_id}".encode("utf-8"))])
+        buttons.append(
+            [Button.inline(f"{status_icon} {_truncate_button_text(title, 40)}", f"src:noop:{source_id}".encode("utf-8"))]
+        )
         buttons.append(
             [
                 Button.inline(toggle_label, f"src:toggle:{source_id}".encode("utf-8")),
@@ -314,7 +334,15 @@ def generate_source_list_message(db: Database, runtime: DownloaderRuntime) -> tu
             ]
         )
 
-    buttons.append([Button.inline("🔄 刷新列表", b"src:refresh")])
+    nav: List[Button] = []
+    if page > 0:
+        nav.append(Button.inline("⬅️ 上一页", f"src:page:{page - 1}".encode("utf-8")))
+    if page < pages - 1:
+        nav.append(Button.inline("下一页 ➡️", f"src:page:{page + 1}".encode("utf-8")))
+    if nav:
+        buttons.append(nav)
+
+    buttons.append([Button.inline("🔄 刷新列表", f"src:refresh:{page}".encode("utf-8"))])
     return "\n".join(text_lines).strip(), buttons
 
 
@@ -542,6 +570,9 @@ async def main_async() -> None:
     pending: Dict[int, PendingState] = {}
     topic_page_size = int(_env_int("BOT_TOPIC_PAGE_SIZE", 10) or 10)
     topic_page_size = max(5, min(20, topic_page_size))
+    source_page_size = int(_env_int("BOT_SOURCE_PAGE_SIZE", 8) or 8)
+    source_page_size = max(3, min(12, source_page_size))
+    source_list_page_by_user: Dict[int, int] = {}
 
     def is_admin(user_id: Optional[int]) -> bool:
         return user_id is not None and int(user_id) in admin_ids
@@ -745,8 +776,12 @@ async def main_async() -> None:
         await event.reply(msg, buttons=_reply_menu_keyboard())
 
     async def send_source_list(event) -> None:
-        text, buttons = generate_source_list_message(db, runtime)
-        await event.reply(text, buttons=buttons)
+        source_list_page_by_user[int(event.sender_id or 0)] = 0
+        text, buttons = generate_source_list_message(db, runtime, page=0, page_size=source_page_size)
+        try:
+            await event.reply(text, buttons=buttons)
+        except ReplyMarkupInvalidError:
+            await event.reply(text)
 
     async def send_group_list(event) -> None:
         text, buttons = generate_forum_group_list_message(db)
@@ -909,15 +944,33 @@ async def main_async() -> None:
             parts = data.decode("utf-8", errors="ignore").split(":")
             action = parts[1] if len(parts) > 1 else ""
 
-            async def _refresh() -> None:
-                text, buttons = generate_source_list_message(db, runtime)
+            def _current_page() -> int:
+                return int(source_list_page_by_user.get(user_id, 0) or 0)
+
+            async def _refresh(page: Optional[int] = None) -> None:
+                if page is None:
+                    page = _current_page()
+                source_list_page_by_user[user_id] = int(page or 0)
+                text, buttons = generate_source_list_message(db, runtime, page=int(page or 0), page_size=source_page_size)
                 try:
                     await event.edit(text, buttons=buttons)
                 except MessageNotModifiedError:
                     return
+                except ReplyMarkupInvalidError:
+                    await event.edit(text)
 
             if action == "refresh":
-                await _refresh()
+                page = _current_page()
+                if len(parts) >= 3 and parts[2].isdigit():
+                    page = int(parts[2])
+                await _refresh(page=page)
+                return
+
+            if action == "page":
+                if len(parts) < 3 or not parts[2].isdigit():
+                    await event.answer("无效页码", alert=True)
+                    return
+                await _refresh(page=int(parts[2]))
                 return
 
             if action == "noop":
