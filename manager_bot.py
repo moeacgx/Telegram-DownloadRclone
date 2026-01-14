@@ -36,7 +36,34 @@ from telethon import TelegramClient, events, functions, Button
 from telethon.errors.rpcerrorlist import MessageNotModifiedError, ReplyMarkupInvalidError
 
 from database import Database
-from bot import DownloaderRuntime, load_config as load_downloader_config
+from bot import DownloaderRuntime, load_config as load_downloader_config, setup_logging
+
+
+async def _connection_watchdog(client: TelegramClient, name: str) -> None:
+    if not _env_bool("TG_PING_ENABLED", True):
+        return
+
+    interval = float(_env_float("TG_PING_INTERVAL_SECONDS", 20.0))
+    timeout = float(_env_float("TG_PING_TIMEOUT_SECONDS", 10.0))
+    interval = max(5.0, float(interval))
+    timeout = max(3.0, float(timeout))
+
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await asyncio.wait_for(client(functions.updates.GetStateRequest()), timeout=timeout)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            # 切换代理节点时，现有连接可能“卡住但不退出”；这里主动断开让外层监督逻辑重连。
+            import logging
+
+            logging.getLogger(__name__).warning("%s 连接疑似卡死/超时，将触发重连：%s", name, str(e))
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            return
 
 
 def _env_int(name: str, default: Optional[int] = None) -> Optional[int]:
@@ -61,6 +88,16 @@ def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
     if value is None or value == "":
         return default
     return str(value)
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return float(default)
+    try:
+        return float(value)
+    except ValueError:
+        raise ValueError(f"环境变量 {name} 必须是数字")
 
 
 def _parse_admin_ids(raw: str) -> List[int]:
@@ -522,6 +559,7 @@ def _help_text() -> str:
 
 async def main_async() -> None:
     load_dotenv()
+    setup_logging(_env_bool("DEBUG", False))
 
     api_id = _env_int("API_ID")
     api_hash = _env_str("API_HASH")
@@ -816,12 +854,16 @@ async def main_async() -> None:
             return
         await event.reply(_build_status_text(), buttons=_reply_menu_keyboard())
 
-    @bot_client.on(events.NewMessage(pattern=r"^/clone\s+(\d+)\b"))
+    @bot_client.on(events.NewMessage(pattern=r"^/clone\s+(\d+)(?:\s+(\d+))?"))
     async def on_clone(event):
         if not is_admin(event.sender_id):
             await deny(event)
             return
         source_id = int(event.pattern_match.group(1))
+        start_from_id = None
+        if event.pattern_match.group(2):
+            start_from_id = int(event.pattern_match.group(2))
+
         source = db.get_download_source(source_id)
         if not source:
             await event.reply("未找到来源", buttons=_reply_menu_keyboard())
@@ -832,9 +874,14 @@ async def main_async() -> None:
         title = str(source.get("display_title") or f"source_{source_id}")
         db.set_download_source_active(source_id, False)
         runtime.refresh_sources_cache(force=True)
-        task = runtime.start_clone(source_id, auto_listen=True)
+        task = runtime.start_clone(source_id, auto_listen=True, start_from_message_id=start_from_id)
         asyncio.create_task(_run_clone_with_progress(int(event.chat_id), source_id, title, task))
-        await event.reply(f"已开始克隆：{title}", buttons=_reply_menu_keyboard())
+
+        # 根据是否指定起始ID，显示不同的提示消息
+        if start_from_id:
+            await event.reply(f"已开始克隆：{title}\n从消息ID {start_from_id} 开始", buttons=_reply_menu_keyboard())
+        else:
+            await event.reply(f"已开始克隆：{title}", buttons=_reply_menu_keyboard())
 
     @bot_client.on(events.NewMessage(pattern=r"^/addchannel\s+(.+)$"))
     async def on_add_channel(event):
@@ -1010,6 +1057,7 @@ async def main_async() -> None:
                             Button.inline("▶ 继续克隆", f"src:clonerun:{source_id}".encode("utf-8")),
                             Button.inline("🔢 指定ID/链接", f"src:cloneask:{source_id}".encode("utf-8")),
                         ],
+                        [Button.inline("🧹 从头克隆", f"src:clonefrom0:{source_id}".encode("utf-8"))],
                         [Button.inline("关闭", b"src:close")],
                     ],
                 )
@@ -1040,6 +1088,27 @@ async def main_async() -> None:
                 db.set_download_source_active(source_id, False)
                 runtime.refresh_sources_cache(force=True)
                 task = runtime.start_clone(source_id, auto_listen=True)
+                asyncio.create_task(
+                    _run_clone_with_progress(
+                        int(event.chat_id),
+                        source_id,
+                        title,
+                        task,
+                        list_message_id=int(getattr(event, "message_id", 0) or 0) or None,
+                    )
+                )
+                await _refresh()
+                return
+
+            if action == "clonefrom0":
+                if runtime.is_cloning(source_id):
+                    await event.answer("已在克隆中")
+                    return
+                title = str(source.get("display_title") or f"source_{source_id}")
+                await event.answer("从头克隆…")
+                db.set_download_source_active(source_id, False)
+                runtime.refresh_sources_cache(force=True)
+                task = runtime.start_clone(source_id, auto_listen=True, start_from_message_id=1)
                 asyncio.create_task(
                     _run_clone_with_progress(
                         int(event.chat_id),
@@ -1499,9 +1568,58 @@ async def main_async() -> None:
                 await event.reply(f"操作失败: {e}", buttons=_reply_menu_keyboard())
                 return
 
-    print("管理 Bot 已启动")
+    import logging
+
+    logger = logging.getLogger(__name__)
+    logger.info("管理 Bot 已启动")
+    reconnect_delay = 2.0
+    reconnect_delay_max = 60.0
+    supervise_reconnect = _env_bool("TG_SUPERVISE_RECONNECT", True)
+    reconnect_delay = float(_env_float("TG_RECONNECT_DELAY_INITIAL_SECONDS", reconnect_delay))
+    reconnect_delay_max = float(_env_float("TG_RECONNECT_DELAY_MAX_SECONDS", reconnect_delay_max))
     try:
-        await bot_client.run_until_disconnected()
+        while True:
+            try:
+                watchdog_bot = asyncio.create_task(_connection_watchdog(bot_client, "ManagerBot(bot)"))
+                watchdog_user = asyncio.create_task(_connection_watchdog(user_client, "ManagerBot(user)"))
+                await bot_client.run_until_disconnected()
+                for t in (watchdog_bot, watchdog_user):
+                    if not t.done():
+                        t.cancel()
+                        try:
+                            await t
+                        except Exception:
+                            pass
+                raise ConnectionError("bot_client disconnected")
+            except KeyboardInterrupt:
+                return
+            except Exception as e:
+                if not supervise_reconnect:
+                    raise
+                # Telethon 会尝试自动重连，但在网络波动/代理不稳时可能持续失败并退出。
+                # 这里增加一层“监督重启”，避免需要手动重开脚本。
+                logger.warning(f"管理 Bot 连接中断：{e}，{reconnect_delay:.0f}s 后重试…")
+
+                await asyncio.sleep(float(reconnect_delay))
+                reconnect_delay = min(reconnect_delay * 2.0, reconnect_delay_max)
+
+                try:
+                    if not await user_client.is_connected():
+                        await user_client.connect()
+                except Exception:
+                    pass
+
+                try:
+                    await bot_client.disconnect()
+                except Exception:
+                    pass
+                try:
+                    await bot_client.start(bot_token=bot_token)
+                    logger.info("管理 Bot 已恢复连接")
+                    reconnect_delay = 2.0
+                    continue
+                except Exception:
+                    continue
     finally:
         pending.clear()
         await runtime.stop()

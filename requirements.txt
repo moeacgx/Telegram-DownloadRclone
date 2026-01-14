@@ -22,6 +22,8 @@ colorama==0.4.6
     #   build
     #   click
     #   pytest
+cryptg==0.5.2
+    # via -r requirements.in
 h11==0.14.0
     # via httpcore
 httpcore==1.0.5
@@ -41,7 +43,7 @@ packaging==24.1
     #   pytest
 pillow==12.1.0
     # via -r requirements.in
-pip-tools==7.4.1
+pip-tools==7.5.2
     # via -r requirements.in
 pluggy==1.5.0
     # via pytest
