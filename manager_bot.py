@@ -33,6 +33,7 @@ except ImportError:
     socks = None
 
 from telethon import TelegramClient, events, functions, Button
+from telethon.errors.rpcerrorlist import MessageNotModifiedError
 
 from database import Database
 from bot import DownloaderRuntime, load_config as load_downloader_config
@@ -910,7 +911,10 @@ async def main_async() -> None:
 
             async def _refresh() -> None:
                 text, buttons = generate_source_list_message(db, runtime)
-                await event.edit(text, buttons=buttons)
+                try:
+                    await event.edit(text, buttons=buttons)
+                except MessageNotModifiedError:
+                    return
 
             if action == "refresh":
                 await _refresh()
@@ -1041,7 +1045,10 @@ async def main_async() -> None:
 
             async def _grefresh() -> None:
                 text, buttons = generate_forum_group_list_message(db)
-                await event.edit(text, buttons=buttons)
+                try:
+                    await event.edit(text, buttons=buttons)
+                except MessageNotModifiedError:
+                    return
 
             if action == "refresh":
                 await _grefresh()
