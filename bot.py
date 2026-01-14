@@ -30,7 +30,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from dotenv import load_dotenv
 
@@ -47,6 +47,17 @@ from database import Database
 logger = logging.getLogger(__name__)
 
 DATE_RE = re.compile(r"(\d{4})年(\d{1,2})月(\d{1,2})日")
+
+
+@dataclass(frozen=True)
+class PreparedDownloadGroup:
+    group_uid: str
+    date_str: str
+    seq: int
+    group_folder: str
+    local_dir: Path
+    remote_dir: Optional[str]
+    last_message_id: int
 
 
 def _env_int(name: str, default: Optional[int] = None) -> Optional[int]:
@@ -207,37 +218,53 @@ class MediaGroupCollector:
     def __init__(
         self,
         flush_seconds: float,
-        on_group: Callable[[int, List], asyncio.Future],
+        on_group: Callable[[int, int, Optional[str], List], asyncio.Future],
     ) -> None:
         self._flush_seconds = max(0.5, float(flush_seconds))
         self._on_group = on_group
         self._pending: Dict[Tuple[int, int], List] = {}
         self._tasks: Dict[Tuple[int, int], asyncio.Task] = {}
+        self._headers: Dict[Tuple[int, int], Optional[str]] = {}
+        self._flush_by_key: Dict[Tuple[int, int], float] = {}
 
-    def add(self, source_id: int, group_key: int, message) -> None:
+    def add(
+        self,
+        source_id: int,
+        group_key: int,
+        message,
+        header_text: Optional[str] = None,
+        flush_seconds: Optional[float] = None,
+    ) -> None:
         key = (int(source_id), int(group_key))
         self._pending.setdefault(key, []).append(message)
+        if key not in self._headers:
+            self._headers[key] = header_text
+        if flush_seconds is not None:
+            self._flush_by_key[key] = max(0.5, float(flush_seconds))
 
         existing = self._tasks.get(key)
         if existing and not existing.done():
             existing.cancel()
 
-        self._tasks[key] = asyncio.create_task(self._flush_later(key))
+        delay = float(self._flush_by_key.get(key, self._flush_seconds))
+        self._tasks[key] = asyncio.create_task(self._flush_later(key, delay))
 
-    async def _flush_later(self, key: Tuple[int, int]) -> None:
+    async def _flush_later(self, key: Tuple[int, int], delay: float) -> None:
         try:
-            await asyncio.sleep(self._flush_seconds)
+            await asyncio.sleep(float(delay))
         except asyncio.CancelledError:
             return
 
         messages = self._pending.pop(key, [])
         self._tasks.pop(key, None)
+        header_text = self._headers.pop(key, None)
+        self._flush_by_key.pop(key, None)
         if not messages:
             return
 
         messages.sort(key=lambda m: m.id)
         source_id, group_key = key
-        await self._on_group(source_id, messages)
+        await self._on_group(source_id, group_key, header_text, messages)
 
 
 class RcloneUploader:
@@ -330,6 +357,7 @@ async def download_media_group(
     messages: List,
     uploader: RcloneUploader,
     download_semaphore: Optional[asyncio.Semaphore] = None,
+    header_text: Optional[str] = None,
 ) -> None:
     if not messages:
         return
@@ -337,25 +365,9 @@ async def download_media_group(
     if not any(getattr(m, "media", None) for m in messages):
         return
 
-    chat_id = int(source_row["chat_id"])
-    topic_root_message_id = source_row.get("topic_root_message_id")
-    grouped_id = getattr(messages[0], "grouped_id", None)
-
-    group_uid = build_group_uid(chat_id, topic_root_message_id, grouped_id, messages[0].id)
-    if db.download_group_exists(source_row["id"], group_uid):
+    prepared = _prepare_download_group(cfg, db, source_row, messages, header_text=header_text)
+    if not prepared:
         return
-
-    text_for_date = _pick_text_for_date(messages)
-    date_str = extract_date_yyyy_mm_dd(text_for_date, messages[0].date)
-
-    seq = db.get_next_download_seq(source_row["id"], date_str)
-    group_folder = f"TG@BieLaoZai_{seq:03d}"
-
-    source_title = sanitize_path_component(source_row.get("display_title") or f"chat_{abs(chat_id)}")
-    local_dir = cfg.download_root_dir / source_title / date_str / group_folder
-    local_dir.mkdir(parents=True, exist_ok=True)
-
-    last_message_id = max(m.id for m in messages)
 
     try:
         sem = download_semaphore or asyncio.Semaphore(cfg.max_download_concurrency)
@@ -371,36 +383,101 @@ async def download_media_group(
 
         await asyncio.gather(*[_download_one(msg) for msg in messages])
 
-        remote_dir = None
-        if cfg.rclone_enabled:
-            remote_base = cfg.rclone_remote_base_dir.strip("/\\") if cfg.rclone_remote_base_dir else ""
-            remote_rel = "/".join(part for part in [remote_base, source_title, date_str, group_folder] if part)
-            remote_dir = f"{cfg.rclone_remote}{remote_rel}"
-
         db.add_download_group(
             source_id=source_row["id"],
-            group_uid=group_uid,
-            date=date_str,
-            seq=seq,
-            last_message_id=last_message_id,
-            local_dir=str(local_dir),
-            remote_dir=remote_dir,
+            group_uid=prepared.group_uid,
+            date=prepared.date_str,
+            seq=prepared.seq,
+            last_message_id=prepared.last_message_id,
+            local_dir=str(prepared.local_dir),
+            remote_dir=prepared.remote_dir,
             status="downloaded",
         )
 
-        db.update_download_source_last_message(source_row["id"], last_message_id)
-        logger.info(f"下载完成: source={source_row['id']} date={date_str} seq={seq:03d} last={last_message_id}")
+        db.update_download_source_last_message(source_row["id"], prepared.last_message_id)
+        logger.info(
+            f"下载完成: source={source_row['id']} date={prepared.date_str} seq={prepared.seq:03d} last={prepared.last_message_id}"
+        )
 
-        if cfg.rclone_enabled and remote_dir:
-            await uploader.enqueue(source_row["id"], group_uid, local_dir, remote_dir)
+        if cfg.rclone_enabled and prepared.remote_dir:
+            await uploader.enqueue(source_row["id"], prepared.group_uid, prepared.local_dir, prepared.remote_dir)
 
     except FloodWaitError as e:
-        db.mark_download_group_failed(source_row["id"], group_uid, f"FloodWait: {e}")
+        db.add_download_group(
+            source_id=source_row["id"],
+            group_uid=prepared.group_uid,
+            date=prepared.date_str,
+            seq=prepared.seq,
+            last_message_id=prepared.last_message_id,
+            local_dir=str(prepared.local_dir),
+            remote_dir=prepared.remote_dir,
+            status="failed",
+            error_message=f"FloodWait: {e}",
+        )
         logger.warning(f"触发 FloodWait，等待 {e.seconds}s")
         await asyncio.sleep(int(e.seconds))
     except Exception as e:
-        db.mark_download_group_failed(source_row["id"], group_uid, str(e))
+        db.add_download_group(
+            source_id=source_row["id"],
+            group_uid=prepared.group_uid,
+            date=prepared.date_str,
+            seq=prepared.seq,
+            last_message_id=prepared.last_message_id,
+            local_dir=str(prepared.local_dir),
+            remote_dir=prepared.remote_dir,
+            status="failed",
+            error_message=str(e),
+        )
         logger.error(f"下载失败: {e}", exc_info=True)
+
+
+def _prepare_download_group(
+    cfg: AppConfig,
+    db: Database,
+    source_row: dict,
+    messages: List,
+    header_text: Optional[str] = None,
+) -> Optional[PreparedDownloadGroup]:
+    if not messages:
+        return None
+    if not any(getattr(m, "media", None) for m in messages):
+        return None
+
+    chat_id = int(source_row["chat_id"])
+    topic_root_message_id = source_row.get("topic_id") or source_row.get("topic_root_message_id")
+    grouped_id = getattr(messages[0], "grouped_id", None)
+
+    group_uid = build_group_uid(chat_id, topic_root_message_id, grouped_id, messages[0].id)
+    if db.download_group_exists(source_row["id"], group_uid):
+        return None
+
+    text_for_date = header_text or _pick_text_for_date(messages)
+    date_str = extract_date_yyyy_mm_dd(text_for_date, messages[0].date)
+
+    seq = db.get_next_download_seq(source_row["id"], date_str)
+    group_folder = f"TG@BieLaoZai_{seq:03d}"
+
+    source_title = sanitize_path_component(source_row.get("display_title") or f"chat_{abs(chat_id)}")
+    local_dir = cfg.download_root_dir / source_title / date_str / group_folder
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    remote_dir = None
+    if cfg.rclone_enabled:
+        remote_base = cfg.rclone_remote_base_dir.strip("/\\") if cfg.rclone_remote_base_dir else ""
+        remote_rel = "/".join(part for part in [remote_base, source_title, date_str, group_folder] if part)
+        remote_dir = f"{cfg.rclone_remote}{remote_rel}"
+
+    last_message_id = max(int(m.id) for m in messages)
+
+    return PreparedDownloadGroup(
+        group_uid=str(group_uid),
+        date_str=str(date_str),
+        seq=int(seq),
+        group_folder=str(group_folder),
+        local_dir=local_dir,
+        remote_dir=remote_dir,
+        last_message_id=int(last_message_id),
+    )
 
 
 def _message_in_topic(message, topic_root_message_id: int) -> bool:
@@ -443,6 +520,7 @@ class DownloaderRuntime:
 
         self._clone_tasks: Dict[int, asyncio.Task] = {}
         self._clone_progress: Dict[int, dict] = {}
+        self._last_header_text: Dict[int, str] = {}
         self._handler_installed = False
 
     def start(self) -> None:
@@ -494,13 +572,14 @@ class DownloaderRuntime:
 
     async def _on_new_message(self, event) -> None:
         message = event.message
-        if not getattr(message, "media", None):
-            return
 
         self.refresh_sources_cache()
         candidates = self._sources_by_chat.get(int(event.chat_id), [])
         if not candidates:
             return
+
+        msg_text = (getattr(message, "raw_text", None) or getattr(message, "message", None) or "").strip()
+        has_media = bool(getattr(message, "media", None))
 
         for source in candidates:
             source_id = int(source["id"])
@@ -508,14 +587,30 @@ class DownloaderRuntime:
                 continue
 
             if source["source_type"] == "forum_topic":
-                topic_root = int(source.get("topic_root_message_id") or 0)
+                topic_root = int(source.get("topic_id") or source.get("topic_root_message_id") or 0)
                 if not topic_root or not _message_in_topic(message, topic_root):
                     continue
 
-            group_key = int(getattr(message, "grouped_id", None) or message.id)
-            self._collector.add(source_id, group_key, message)
+            # 记录“标题/说明”文本，供后续媒体组抽取日期（很多频道是先发文字再连发多条媒体）
+            if (not has_media) and msg_text:
+                self._last_header_text[source_id] = msg_text
+                continue
 
-    async def _on_media_group(self, source_id: int, messages: List) -> None:
+            if not has_media:
+                continue
+
+            group_key = int(getattr(message, "grouped_id", None) or message.id)
+            flush_seconds = float(self._cfg.media_group_flush_seconds)
+
+            self._collector.add(
+                source_id,
+                group_key,
+                message,
+                header_text=self._last_header_text.get(source_id),
+                flush_seconds=flush_seconds,
+            )
+
+    async def _on_media_group(self, source_id: int, group_key: int, header_text: Optional[str], messages: List) -> None:
         source = self._db.get_download_source(int(source_id))
         if not source:
             return
@@ -527,6 +622,7 @@ class DownloaderRuntime:
             messages,
             self._uploader,
             download_semaphore=self._download_semaphore,
+            header_text=header_text,
         )
 
     def start_clone(
@@ -711,61 +807,133 @@ async def backfill_single_source(
 
     entity = await client.get_entity(chat_id)
     reply_to = None
-    if source["source_type"] == "forum_topic" and source.get("topic_root_message_id"):
-        reply_to = int(source["topic_root_message_id"])
+    if source["source_type"] == "forum_topic":
+        # Forum 话题：topic_id 才是 thread_id（链接里的那段）；topic_root_message_id 可能是旧/错数据
+        thread_id = int(source.get("topic_id") or source.get("topic_root_message_id") or 0)
+        if thread_id:
+            reply_to = thread_id
 
     pending_group_key: Optional[int] = None
     pending_messages: List = []
+    pending_header_text: Optional[str] = None
+    last_header_text: Optional[str] = None
 
-    async for msg in client.iter_messages(
-        entity,
-        min_id=last_message_id,
-        reverse=True,
-        reply_to=reply_to,
-    ):
-        if not getattr(msg, "media", None):
-            continue
+    inflight: Set[asyncio.Task] = set()
+    max_inflight_groups = max(5, int(cfg.max_download_concurrency) * 4)
 
-        group_key = int(getattr(msg, "grouped_id", None) or msg.id)
-        if pending_group_key is None:
-            pending_group_key = group_key
+    async def _drain_inflight_if_needed() -> None:
+        nonlocal inflight
+        if len(inflight) < max_inflight_groups:
+            return
+        done, pending = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
+        inflight = set(pending)
+        # 触发异常也不影响整体流程（download_media_group 内部会记录失败）
+        for t in done:
+            try:
+                _ = t.exception()
+            except Exception:
+                pass
 
-        if group_key != pending_group_key:
-            await download_media_group(
+    def _reset_pending() -> None:
+        nonlocal pending_group_key, pending_messages, pending_header_text
+        pending_group_key = None
+        pending_messages = []
+        pending_header_text = None
+
+    async def _flush_pending() -> None:
+        if not pending_messages:
+            _reset_pending()
+            return
+
+        messages_snapshot = list(pending_messages)
+        header_snapshot = pending_header_text
+        last_id = int(max(m.id for m in messages_snapshot))
+        _reset_pending()
+
+        if progress_hook:
+            try:
+                progress_hook(last_id)
+            except Exception:
+                pass
+
+        task = asyncio.create_task(
+            download_media_group(
                 client,
                 cfg,
                 db,
                 source,
-                pending_messages,
+                messages_snapshot,
                 uploader,
                 download_semaphore=download_semaphore,
+                header_text=header_snapshot,
             )
-            if progress_hook and pending_messages:
-                try:
-                    progress_hook(int(max(m.id for m in pending_messages)))
-                except Exception:
-                    pass
+        )
+        inflight.add(task)
+        await _drain_inflight_if_needed()
 
-            pending_messages = []
+    async def _handle_message(msg) -> None:
+        nonlocal pending_group_key, pending_messages, pending_header_text, last_header_text
+
+        msg_text = (getattr(msg, "raw_text", None) or getattr(msg, "message", None) or "").strip()
+        has_media = bool(getattr(msg, "media", None))
+
+        # 标题/说明文本：用于后续媒体组抽取日期
+        if (not has_media) and msg_text:
+            last_header_text = msg_text
+            return
+
+        if not has_media:
+            return
+
+        group_key = int(getattr(msg, "grouped_id", None) or msg.id)
+        if pending_group_key is None:
             pending_group_key = group_key
+            pending_header_text = last_header_text
+
+        if group_key != pending_group_key:
+            await _flush_pending()
+            pending_group_key = group_key
+            pending_header_text = last_header_text
 
         pending_messages.append(msg)
 
+    used_fallback = False
+    try:
+        async for msg in client.iter_messages(
+            entity,
+            min_id=last_message_id,
+            reverse=True,
+            reply_to=reply_to,
+        ):
+            await _handle_message(msg)
+    except Exception as e:
+        # forum 话题在某些场景下 reply_to 会触发 GetRepliesRequest，可能报 TOPIC_ID_INVALID。
+        # 兜底：改为遍历全群消息，并用 reply_to_top_id/top_msg_id 过滤话题消息（更慢但更稳）。
+        if reply_to and source.get("source_type") == "forum_topic" and "TOPIC_ID_INVALID" in str(e):
+            used_fallback = True
+            logger.warning(
+                f"forum_topic reply_to 无效，降级为全群遍历过滤: source={source.get('id')} chat_id={chat_id} topic_root={reply_to} err={e}"
+            )
+            await _flush_pending()
+        else:
+            raise
+
+    if used_fallback and reply_to:
+        async for msg in client.iter_messages(
+            entity,
+            min_id=last_message_id,
+            reverse=True,
+            reply_to=None,
+        ):
+            if not _message_in_topic(msg, int(reply_to)):
+                continue
+            await _handle_message(msg)
+
     if pending_messages:
-        await download_media_group(
-            client,
-            cfg,
-            db,
-            source,
-            pending_messages,
-            uploader,
-            download_semaphore=download_semaphore,
-        )
-        if progress_hook:
-            try:
-                progress_hook(int(max(m.id for m in pending_messages)))
-            except Exception:
-                pass
+        await _flush_pending()
+
+    if inflight:
+        await asyncio.gather(*list(inflight), return_exceptions=True)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

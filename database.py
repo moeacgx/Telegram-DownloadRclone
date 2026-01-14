@@ -50,6 +50,18 @@ class Database:
 
         cursor.execute(
             """
+            CREATE TABLE IF NOT EXISTS forum_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL UNIQUE,
+                title TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS download_sources (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_type TEXT NOT NULL,
@@ -113,7 +125,69 @@ class Database:
         except Exception:
             pass
 
+        # 迁移：Forum 话题的 thread_id 应为 topic_id（t.me/c/.../<thread_id>/<msg_id>），
+        # 历史上可能误把 “top_message(最新消息)” 写进 topic_root_message_id，导致 reply_to 失败。
+        try:
+            cursor.execute(
+                """
+                UPDATE download_sources
+                SET topic_root_message_id=topic_id, updated_at=CURRENT_TIMESTAMP
+                WHERE source_type='forum_topic'
+                  AND topic_id IS NOT NULL
+                  AND CAST(topic_id AS INTEGER) > 0
+                  AND CAST(topic_root_message_id AS INTEGER) != CAST(topic_id AS INTEGER)
+                  AND NOT EXISTS (
+                    SELECT 1 FROM download_sources d2
+                    WHERE d2.chat_id = download_sources.chat_id
+                      AND CAST(d2.topic_root_message_id AS INTEGER) = CAST(download_sources.topic_id AS INTEGER)
+                      AND d2.id != download_sources.id
+                  )
+                """
+            )
+        except Exception:
+            pass
+
         self.conn.commit()
+
+    # -------------------------
+    # Forum groups
+    # -------------------------
+
+    def upsert_forum_group(self, chat_id: int, title: str) -> int:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "INSERT OR IGNORE INTO forum_groups (chat_id, title) VALUES (?, ?)",
+            (int(chat_id), str(title)),
+        )
+        cursor.execute(
+            "UPDATE forum_groups SET title=?, updated_at=CURRENT_TIMESTAMP WHERE chat_id=?",
+            (str(title), int(chat_id)),
+        )
+        self.conn.commit()
+
+        cursor.execute("SELECT id FROM forum_groups WHERE chat_id=?", (int(chat_id),))
+        row = cursor.fetchone()
+        return int(row[0]) if row else 0
+
+    def get_forum_group(self, group_id: int) -> Optional[dict]:
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT id, chat_id, title FROM forum_groups WHERE id=?", (int(group_id),))
+        r = cursor.fetchone()
+        if not r:
+            return None
+        return {"id": int(r[0]), "chat_id": int(r[1]), "title": r[2]}
+
+    def list_forum_groups(self) -> list:
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT id, chat_id, title FROM forum_groups ORDER BY updated_at DESC, id DESC")
+        rows = cursor.fetchall()
+        return [{"id": int(r[0]), "chat_id": int(r[1]), "title": r[2]} for r in rows]
+
+    def delete_forum_group(self, group_id: int) -> bool:
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM forum_groups WHERE id=?", (int(group_id),))
+        self.conn.commit()
+        return cursor.rowcount > 0
 
     # -------------------------
     # Sources
@@ -283,7 +357,8 @@ class Database:
     def download_group_exists(self, source_id: int, group_uid: str) -> bool:
         cursor = self.conn.cursor()
         cursor.execute(
-            "SELECT 1 FROM download_groups WHERE source_id=? AND group_uid=? LIMIT 1",
+            # failed 允许重试，因此不算“已存在”
+            "SELECT 1 FROM download_groups WHERE source_id=? AND group_uid=? AND status!='failed' LIMIT 1",
             (int(source_id), str(group_uid)),
         )
         return cursor.fetchone() is not None
@@ -303,10 +378,23 @@ class Database:
         cursor = self.conn.cursor()
         cursor.execute(
             """
-            INSERT OR IGNORE INTO download_groups
+            INSERT INTO download_groups
                 (source_id, group_uid, date, seq, last_message_id, local_dir, remote_dir, status, error_message)
             VALUES
                 (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source_id, group_uid) DO UPDATE SET
+                date=excluded.date,
+                seq=excluded.seq,
+                last_message_id=excluded.last_message_id,
+                local_dir=excluded.local_dir,
+                remote_dir=excluded.remote_dir,
+                status=excluded.status,
+                error_message=excluded.error_message,
+                updated_at=CURRENT_TIMESTAMP,
+                downloaded_at=CASE
+                    WHEN excluded.status='downloaded' THEN CURRENT_TIMESTAMP
+                    ELSE download_groups.downloaded_at
+                END
             """,
             (
                 int(source_id),

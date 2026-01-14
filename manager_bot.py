@@ -19,6 +19,7 @@ import asyncio
 import os
 import re
 import sys
+import time
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
@@ -198,8 +199,9 @@ def _reply_menu_keyboard() -> List[List[Button]]:
     kw = {"resize": True, "persistent": True, "placeholder": "选择操作…"}
     return [
         [Button.text("添加频道", **kw), Button.text("添加群话题", **kw)],
-        [Button.text("频道列表", **kw), Button.text("状态", **kw)],
-        [Button.text("帮助", **kw), Button.text("菜单", **kw)],
+        [Button.text("频道列表", **kw), Button.text("超级群组列表", **kw)],
+        [Button.text("状态", **kw), Button.text("帮助", **kw)],
+        [Button.text("菜单", **kw)],
     ]
 
 
@@ -312,6 +314,42 @@ def generate_source_list_message(db: Database, runtime: DownloaderRuntime) -> tu
         )
 
     buttons.append([Button.inline("🔄 刷新列表", b"src:refresh")])
+    return "\n".join(text_lines).strip(), buttons
+
+
+def generate_forum_group_list_message(db: Database) -> tuple[str, List[List[Button]]]:
+    groups = db.list_forum_groups()
+    if not groups:
+        return (
+            "👥 超级群组列表为空。\n\n"
+            "请先用“添加群话题”添加一次群组（可不选话题也没关系），之后就能在这里一键重新获取话题。",
+            [[Button.inline("➕ 添加群话题", b"grp:add")]],
+        )
+
+    text_lines: List[str] = ["👥 超级群组列表\n"]
+    buttons: List[List[Button]] = []
+
+    for g in groups:
+        group_id = int(g["id"])
+        title = str(g.get("title") or f"group_{group_id}")
+        chat_id = int(g.get("chat_id") or 0)
+        text_lines.append(f"• {title}\n   chat_id: {chat_id}\n")
+        buttons.append(
+            [Button.inline(f"👥 {_truncate_button_text(title, 40)}", f"grp:noop:{group_id}".encode("utf-8"))]
+        )
+        buttons.append(
+            [
+                Button.inline("🧵 获取话题", f"grp:topics:{group_id}".encode("utf-8")),
+                Button.inline("🗑️ 删除记录", f"grp:del:{group_id}".encode("utf-8")),
+            ]
+        )
+
+    buttons.append(
+        [
+            Button.inline("➕ 添加群话题", b"grp:add"),
+            Button.inline("🔄 刷新列表", b"grp:refresh"),
+        ]
+    )
     return "\n".join(text_lines).strip(), buttons
 
 
@@ -430,6 +468,7 @@ def _help_text() -> str:
         "管理方式：\n"
         "- 推荐：使用输入框下方的菜单键盘（/start 或 /menu）\n"
         "- 频道列表里可：暂停/恢复监听、点击“克隆”（历史下载），克隆完成自动切换监听\n"
+        "- 超级群组列表：保存群组快捷记录，一键重新拉取话题并选择加入工作列表\n"
         "- 兼容：仍支持文本命令（不推荐）\n"
         "\n"
         "文本命令：\n"
@@ -494,6 +533,194 @@ async def main_async() -> None:
     def is_admin(user_id: Optional[int]) -> bool:
         return user_id is not None and int(user_id) in admin_ids
 
+    def _format_clone_progress_text(title: str, source_id: int) -> str:
+        prog = None
+        try:
+            prog = runtime.get_clone_progress(source_id)
+        except Exception:
+            prog = None
+
+        if not prog:
+            return f"📦 正在克隆：{title}\n状态：初始化中…"
+
+        status = str(prog.get("status") or "running")
+        groups_done = int(prog.get("groups_done") or 0)
+        cur = int(prog.get("current_message_id") or 0)
+        latest = int(prog.get("latest_message_id") or 0)
+        start_from = int(prog.get("start_from_message_id") or 0)
+        last_error = str(prog.get("last_error") or prog.get("latest_error") or "").strip()
+
+        if latest > 0 and cur > 0:
+            progress_line = f"进度：{cur}/{latest}"
+        elif cur > 0:
+            progress_line = f"进度：到消息 {cur}"
+        else:
+            progress_line = "进度：计算中…"
+
+        start_line = f"起始：{start_from}" if start_from > 0 else "起始：自动（last_message_id）"
+        updated_at = time.strftime("%H:%M:%S", time.localtime())
+
+        text = (
+            f"📦 正在克隆：{title}\n"
+            f"状态：{status}\n"
+            f"{progress_line}（已完成媒体组：{groups_done}）\n"
+            f"{start_line}\n"
+            f"更新时间：{updated_at}"
+        )
+        if last_error:
+            text += f"\n\n最近错误：{last_error}"
+        return text
+
+    def _build_status_text() -> str:
+        sources_all = db.list_download_sources(active_only=False)
+        sources_active = db.list_download_sources(active_only=True)
+        forum_groups = []
+        try:
+            forum_groups = db.list_forum_groups()
+        except Exception:
+            forum_groups = []
+
+        cloning_lines: List[str] = []
+        total_downloaded = 0
+        total_failed = 0
+        for s in sources_all:
+            sid = int(s["id"])
+            counts = db.count_download_groups_by_status(sid)
+            total_downloaded += int(counts.get("total", 0))
+            total_failed += int(counts.get("failed", 0))
+            if runtime.is_cloning(sid):
+                prog = None
+                try:
+                    prog = runtime.get_clone_progress(sid)
+                except Exception:
+                    prog = None
+                title = str(s.get("display_title") or f"source_{sid}")
+                if prog:
+                    cur = int(prog.get("current_message_id") or 0)
+                    latest = int(prog.get("latest_message_id") or 0)
+                    groups_done = int(prog.get("groups_done") or 0)
+                    if latest > 0 and cur > 0:
+                        cloning_lines.append(f"- {title}: {cur}/{latest}（组 {groups_done}）")
+                    elif cur > 0:
+                        cloning_lines.append(f"- {title}: 到 {cur}（组 {groups_done}）")
+                    else:
+                        cloning_lines.append(f"- {title}: 克隆中…")
+                else:
+                    cloning_lines.append(f"- {title}: 克隆中…")
+
+        upload_q = None
+        try:
+            upload_q = int(getattr(getattr(runtime, "_uploader", None), "_queue", None).qsize())  # type: ignore[attr-defined]
+        except Exception:
+            upload_q = None
+
+        lines: List[str] = [
+            "📈 状态",
+            f"- 来源：{len(sources_all)}（启用 {len(sources_active)}）",
+            f"- 超级群组记录：{len(forum_groups)}",
+            f"- 已下载媒体组：{total_downloaded}（失败 {total_failed}）",
+        ]
+        if upload_q is not None:
+            lines.append(f"- 待上传队列：{upload_q}")
+        if cloning_lines:
+            lines.append("")
+            lines.append("📦 正在克隆：")
+            lines.extend(cloning_lines[:10])
+            if len(cloning_lines) > 10:
+                lines.append(f"... 还有 {len(cloning_lines) - 10} 个")
+        else:
+            lines.append("- 当前无克隆任务")
+
+        return "\n".join(lines)
+
+    async def _run_clone_with_progress(
+        chat_id: int,
+        source_id: int,
+        title: str,
+        task: asyncio.Task,
+        list_message_id: Optional[int] = None,
+    ) -> None:
+        try:
+            # 先发一条进度消息，后续不断编辑（不刷屏）
+            progress_msg = await bot_client.send_message(
+                int(chat_id),
+                _format_clone_progress_text(title, source_id),
+                buttons=_reply_menu_keyboard(),
+            )
+
+            last_text: Optional[str] = None
+            last_list_refresh = 0.0
+            can_edit = True
+
+            while True:
+                done = task.done()
+                text = _format_clone_progress_text(title, source_id)
+                if text != last_text:
+                    if can_edit:
+                        try:
+                            await bot_client.edit_message(
+                                int(chat_id),
+                                int(progress_msg.id),
+                                text,
+                                buttons=_reply_menu_keyboard(),
+                            )
+                        except Exception:
+                            # 不能编辑就降级：后续不再 edit，避免 task 崩溃；仅在结束时发结果消息
+                            can_edit = False
+                    last_text = text
+
+                # 同步刷新“频道列表”那条消息（如果有）
+                if list_message_id and (time.time() - last_list_refresh) >= 6.0:
+                    try:
+                        list_text, list_buttons = generate_source_list_message(db, runtime)
+                        await bot_client.edit_message(int(chat_id), int(list_message_id), list_text, buttons=list_buttons)
+                    except Exception:
+                        pass
+                    last_list_refresh = time.time()
+
+                if done:
+                    break
+                await asyncio.sleep(2.0)
+
+            # 完成后补一次最终刷新
+            try:
+                list_text, list_buttons = generate_source_list_message(db, runtime)
+                if list_message_id:
+                    await bot_client.edit_message(int(chat_id), int(list_message_id), list_text, buttons=list_buttons)
+            except Exception:
+                pass
+
+            ok = False
+            err: Optional[Exception] = None
+            try:
+                await task
+                ok = True
+            except Exception as e:
+                ok = False
+                err = e
+
+            final_text = f"✅ 克隆完成并已开始监听：{title}" if ok else f"❌ 克隆失败：{title}\n原因：{err}"
+
+            if can_edit:
+                try:
+                    await bot_client.edit_message(
+                        int(chat_id),
+                        int(progress_msg.id),
+                        final_text,
+                        buttons=_reply_menu_keyboard(),
+                    )
+                    return
+                except Exception:
+                    pass
+
+            try:
+                await bot_client.send_message(int(chat_id), final_text, buttons=_reply_menu_keyboard())
+            except Exception:
+                pass
+        except Exception:
+            # 绝不让后台 task 抛出未处理异常
+            return
+
     async def deny(event, text: str = "无权限") -> None:
         try:
             await event.reply(text)
@@ -506,6 +733,10 @@ async def main_async() -> None:
 
     async def send_source_list(event) -> None:
         text, buttons = generate_source_list_message(db, runtime)
+        await event.reply(text, buttons=buttons)
+
+    async def send_group_list(event) -> None:
+        text, buttons = generate_forum_group_list_message(db)
         await event.reply(text, buttons=buttons)
 
     @bot_client.on(events.NewMessage(pattern=r"^/start\b"))
@@ -535,8 +766,7 @@ async def main_async() -> None:
         if not is_admin(event.sender_id):
             await deny(event)
             return
-        sources = db.list_download_sources(active_only=True)
-        await event.reply(f"启用来源数: {len(sources)}", buttons=_reply_menu_keyboard())
+        await event.reply(_build_status_text(), buttons=_reply_menu_keyboard())
 
     @bot_client.on(events.NewMessage(pattern=r"^/clone\s+(\d+)\b"))
     async def on_clone(event):
@@ -548,8 +778,15 @@ async def main_async() -> None:
         if not source:
             await event.reply("未找到来源", buttons=_reply_menu_keyboard())
             return
-        runtime.start_clone(source_id, auto_listen=True)
-        await event.reply(f"已开始克隆：{source.get('display_title')}", buttons=_reply_menu_keyboard())
+        if runtime.is_cloning(source_id):
+            await event.reply("该来源正在克隆中", buttons=_reply_menu_keyboard())
+            return
+        title = str(source.get("display_title") or f"source_{source_id}")
+        db.set_download_source_active(source_id, False)
+        runtime.refresh_sources_cache(force=True)
+        task = runtime.start_clone(source_id, auto_listen=True)
+        asyncio.create_task(_run_clone_with_progress(int(event.chat_id), source_id, title, task))
+        await event.reply(f"已开始克隆：{title}", buttons=_reply_menu_keyboard())
 
     @bot_client.on(events.NewMessage(pattern=r"^/addchannel\s+(.+)$"))
     async def on_add_channel(event):
@@ -601,6 +838,10 @@ async def main_async() -> None:
                 raise RuntimeError("无法解析 chat_id")
 
             chat_id = _to_telegram_chat_id(raw_id)
+            try:
+                db.upsert_forum_group(chat_id, str(group_title))
+            except Exception:
+                pass
 
             topics = await _fetch_forum_topics(user_client, entity, query=query)
             if not topics:
@@ -611,8 +852,10 @@ async def main_async() -> None:
             for t in topics:
                 topic_rows.append(
                     {
+                        # 注意：t.id 才是 thread_id（t.me/c/.../<thread_id>/<msg_id>）
                         "id": int(getattr(t, "id", 0) or 0),
                         "title": str(getattr(t, "title", "") or ""),
+                        # top_message 在很多群里是“该话题最新消息ID”，不是 thread_id
                         "top_message": int(getattr(t, "top_message", 0) or 0),
                     }
                 )
@@ -693,23 +936,15 @@ async def main_async() -> None:
                 db.set_download_source_active(source_id, False)
                 runtime.refresh_sources_cache(force=True)
                 task = runtime.start_clone(source_id, auto_listen=True)
-
-                async def _notify() -> None:
-                    try:
-                        await task
-                        await bot_client.send_message(
-                            int(event.chat_id),
-                            f"✅ 克隆完成并已开始监听：{title}",
-                            buttons=_reply_menu_keyboard(),
-                        )
-                    except Exception as e:
-                        await bot_client.send_message(
-                            int(event.chat_id),
-                            f"❌ 克隆失败：{title}\n原因：{e}",
-                            buttons=_reply_menu_keyboard(),
-                        )
-
-                asyncio.create_task(_notify())
+                asyncio.create_task(
+                    _run_clone_with_progress(
+                        int(event.chat_id),
+                        source_id,
+                        title,
+                        task,
+                        list_message_id=int(getattr(event, "message_id", 0) or 0) or None,
+                    )
+                )
                 await _refresh()
                 return
 
@@ -746,6 +981,99 @@ async def main_async() -> None:
                 await _refresh()
                 return
 
+        if data.startswith(b"grp:"):
+            parts = data.decode("utf-8", errors="ignore").split(":")
+            action = parts[1] if len(parts) > 1 else ""
+
+            async def _grefresh() -> None:
+                text, buttons = generate_forum_group_list_message(db)
+                await event.edit(text, buttons=buttons)
+
+            if action == "refresh":
+                await _grefresh()
+                return
+
+            if action == "add":
+                pending[user_id] = PendingTextInput(kind="addgroup")
+                await event.answer("请发送超级群引用（可带关键词）")
+                await bot_client.send_message(
+                    int(event.chat_id),
+                    "请发送超级群引用（用户名/链接/ID），可追加关键词过滤。\n"
+                    "示例：-1001234567890 付费\n"
+                    "示例：@mygroup",
+                    buttons=_reply_menu_keyboard(),
+                )
+                return
+
+            if action == "noop":
+                await event.answer("请选择下方操作按钮")
+                return
+
+            if len(parts) < 3 or not parts[2].isdigit():
+                await event.answer("无效操作", alert=True)
+                return
+
+            group_id = int(parts[2])
+            group = db.get_forum_group(group_id)
+            if not group:
+                await event.answer("群组记录不存在", alert=True)
+                await _grefresh()
+                return
+
+            if action == "topics":
+                try:
+                    entity = await _resolve_entity(user_client, int(group["chat_id"]))
+                    group_title = str(group.get("title") or getattr(entity, "title", None) or f"group_{group_id}")
+                    topics = await _fetch_forum_topics(user_client, entity, query="")
+                    if not topics:
+                        await event.answer("未获取到任何话题，请确认该群已启用 Forum Topics", alert=True)
+                        return
+
+                    topic_rows: List[dict] = []
+                    for t in topics:
+                        topic_rows.append(
+                            {
+                                "id": int(getattr(t, "id", 0) or 0),
+                                "title": str(getattr(t, "title", "") or ""),
+                                "top_message": int(getattr(t, "top_message", 0) or 0),
+                            }
+                        )
+
+                    sel = PendingTopicSelection(
+                        chat_id=int(group["chat_id"]),
+                        group_title=group_title,
+                        topics=topic_rows,
+                        query="",
+                    )
+                    pending[user_id] = sel
+                    await event.edit(
+                        _topic_selection_text(sel, topic_page_size),
+                        buttons=_topic_selection_buttons(sel, topic_page_size),
+                    )
+                    return
+                except Exception as e:
+                    await event.answer(f"获取话题失败: {e}", alert=True)
+                    return
+
+            if action == "del":
+                title = str(group.get("title") or f"group_{group_id}")
+                await event.edit(
+                    f"确认删除群组记录？\n\n{title}\n\n（只删除群组快捷记录，不会删除已添加的话题来源）",
+                    buttons=[
+                        [
+                            Button.inline("确认删除", f"grp:delok:{group_id}".encode("utf-8")),
+                            Button.inline("取消", b"grp:refresh"),
+                        ]
+                    ],
+                )
+                return
+
+            if action == "delok":
+                ok = db.delete_forum_group(group_id)
+                await event.answer("已删除" if ok else "删除失败")
+                await _grefresh()
+                return
+
         if data.startswith(b"topic:"):
             state = pending.get(user_id)
             if not isinstance(state, PendingTopicSelection):
@@ -770,7 +1098,7 @@ async def main_async() -> None:
                         chat_id=state.chat_id,
                         display_title=str(display_title),
                         topic_id=int(topic.get("id") or 0) or None,
-                        topic_root_message_id=int(topic.get("top_message") or 0) or None,
+                        topic_root_message_id=int(topic.get("id") or 0) or None,
                     )
                     if source_id:
                         ok_count += 1
@@ -839,10 +1167,13 @@ async def main_async() -> None:
             pending.pop(user_id, None)
             await send_source_list(event)
             return
+        if text == "超级群组列表":
+            pending.pop(user_id, None)
+            await send_group_list(event)
+            return
         if text == "状态":
             pending.pop(user_id, None)
-            sources = db.list_download_sources(active_only=True)
-            await event.reply(f"启用来源数: {len(sources)}", buttons=_reply_menu_keyboard())
+            await event.reply(_build_status_text(), buttons=_reply_menu_keyboard())
             return
         if text == "添加频道":
             pending[user_id] = PendingTextInput(kind="addchannel")
@@ -909,7 +1240,9 @@ async def main_async() -> None:
                     pending.pop(user_id, None)
                     db.set_download_source_active(src_id, False)
                     runtime.refresh_sources_cache(force=True)
-                    runtime.start_clone(src_id, auto_listen=True, start_from_message_id=msg_id)
+                    task = runtime.start_clone(src_id, auto_listen=True, start_from_message_id=msg_id)
+                    title = str(source.get("display_title") or f"source_{src_id}")
+                    asyncio.create_task(_run_clone_with_progress(int(event.chat_id), src_id, title, task))
                     await event.reply(
                         f"已开始补克隆：{source.get('display_title')}\n起始消息ID: {msg_id}\n\n完成后会自动开始监听。",
                         buttons=_reply_menu_keyboard(),
@@ -926,6 +1259,10 @@ async def main_async() -> None:
                     if not raw_id:
                         raise RuntimeError("无法解析 chat_id")
                     chat_id = _to_telegram_chat_id(raw_id)
+                    try:
+                        db.upsert_forum_group(chat_id, str(group_title))
+                    except Exception:
+                        pass
                     topics = await _fetch_forum_topics(user_client, entity, query=query)
                     if not topics:
                         pending.pop(user_id, None)

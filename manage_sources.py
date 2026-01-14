@@ -269,6 +269,10 @@ async def cmd_add_group_topics(db: Database, ref: str, select: Optional[str]) ->
             raise RuntimeError("无法解析 chat_id")
 
         chat_id = _to_telegram_chat_id(chat_id)
+        try:
+            db.upsert_forum_group(chat_id, str(group_title))
+        except Exception:
+            pass
 
         topics = await _fetch_forum_topics(client, entity)
         if not topics:
@@ -301,7 +305,7 @@ async def cmd_add_group_topics(db: Database, ref: str, select: Optional[str]) ->
                 chat_id=chat_id,
                 display_title=display_title,
                 topic_id=int(topic_id) if topic_id is not None else None,
-                topic_root_message_id=int(topic_root) if topic_root is not None else None,
+                topic_root_message_id=int(topic_id) if topic_id is not None else None,
             )
             print(f"已添加话题: id={source_id} title={display_title}")
 

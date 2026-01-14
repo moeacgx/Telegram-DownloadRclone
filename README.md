@@ -18,6 +18,10 @@
 
 1) 复制 `.env.example` 为 `.env` 并填写 `API_ID` / `API_HASH` / `USER_PHONE` / `BOT_TOKEN` / `ADMIN_USER_IDS`。
 
+常用参数说明（都在 `.env.example` 里）：  
+- `MEDIA_GROUP_FLUSH_SECONDS`：相册（`grouped_id`）聚合等待时间  
+- `MAX_DOWNLOAD_CONCURRENCY`：同时下载的媒体消息数量（全局并发；相册/单条媒体都按“消息数”计）
+
 2) 首次登录生成会话：
 
 ```bash
