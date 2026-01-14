@@ -308,7 +308,7 @@ def generate_source_list_message(db: Database, runtime: DownloaderRuntime) -> tu
             [
                 Button.inline(toggle_label, f"src:toggle:{source_id}".encode("utf-8")),
                 Button.inline("📦 克隆", f"src:clone:{source_id}".encode("utf-8")),
-                Button.inline("🔁 从指定ID", f"src:clonefrom:{source_id}".encode("utf-8")),
+                Button.inline("🔁 补克隆(URL)", f"src:patch:{source_id}".encode("utf-8")),
                 Button.inline("🗑️ 删除", f"src:del:{source_id}".encode("utf-8")),
             ]
         )
@@ -411,22 +411,24 @@ async def _resolve_entity(client: TelegramClient, ref: Union[int, str]):
     raise RuntimeError(f"Cannot find any entity corresponding to {ref!r}{hint}") from last_error
 
 
-def _parse_message_id_or_link(raw: str) -> Tuple[Optional[Union[int, str]], int]:
+def _parse_message_ref(raw: str) -> Tuple[Optional[Union[int, str]], Optional[int], int]:
     """
-    返回：(chat_hint, message_id)
+    返回：(chat_hint, thread_id, message_id)
     - 纯数字：chat_hint=None
     - t.me/c/<internal>/<msg>：chat_hint=-100<internal>
+    - t.me/c/<internal>/<thread>/<msg>：chat_hint=-100<internal>，thread_id=<thread>
     - t.me/<username>/<msg>：chat_hint='@username'
+    - t.me/<username>/<thread>/<msg>：chat_hint='@username'，thread_id=<thread>
     """
     raw = (raw or "").strip()
     if not raw:
         raise ValueError("缺少消息引用")
 
     if re.fullmatch(r"\d+", raw):
-        return None, int(raw)
+        return None, None, int(raw)
 
     if raw.startswith("@") and raw[1:].isdigit():
-        return None, int(raw[1:])
+        return None, None, int(raw[1:])
 
     if raw.startswith("t.me/"):
         raw = "https://" + raw
@@ -448,18 +450,28 @@ def _parse_message_id_or_link(raw: str) -> Tuple[Optional[Union[int, str]], int]
             if len(parts) < 3:
                 raise ValueError("c 链接缺少频道或消息 ID")
             internal = "".join(ch for ch in parts[1] if ch.isdigit())
-            msg_id = "".join(ch for ch in parts[2] if ch.isdigit())
+            if len(parts) >= 4:
+                thread_id = "".join(ch for ch in parts[2] if ch.isdigit())
+                msg_id = "".join(ch for ch in parts[3] if ch.isdigit())
+            else:
+                thread_id = ""
+                msg_id = "".join(ch for ch in parts[2] if ch.isdigit())
             if not internal or not msg_id:
                 raise ValueError("链接格式无效")
-            return int(f"-100{internal}"), int(msg_id)
+            return int(f"-100{internal}"), (int(thread_id) if thread_id else None), int(msg_id)
 
         username = parts[0]
         if len(parts) < 2:
             raise ValueError("链接缺少消息 ID")
-        msg_id = "".join(ch for ch in parts[1] if ch.isdigit())
+        if len(parts) >= 3:
+            thread_id = "".join(ch for ch in parts[1] if ch.isdigit())
+            msg_id = "".join(ch for ch in parts[2] if ch.isdigit())
+        else:
+            thread_id = ""
+            msg_id = "".join(ch for ch in parts[1] if ch.isdigit())
         if not msg_id:
             raise ValueError("链接缺少消息 ID")
-        return f"@{username}", int(msg_id)
+        return f"@{username}", (int(thread_id) if thread_id else None), int(msg_id)
 
     raise ValueError("不支持的消息引用格式")
 
@@ -932,7 +944,42 @@ async def main_async() -> None:
                     return
 
                 title = str(source.get("display_title") or f"source_{source_id}")
-                await event.answer("开始克隆…（如需从指定消息开始，请点“从指定ID”）")
+                await event.answer("请选择克隆起始方式")
+                await bot_client.send_message(
+                    int(event.chat_id),
+                    f"📦 克隆：{title}\n请选择起始方式：\n- 继续克隆：从该来源上次记录的 last_message_id 开始\n- 指定ID/链接：从指定消息开始（包含该消息）",
+                    buttons=[
+                        [
+                            Button.inline("▶ 继续克隆", f"src:clonerun:{source_id}".encode("utf-8")),
+                            Button.inline("🔢 指定ID/链接", f"src:cloneask:{source_id}".encode("utf-8")),
+                        ],
+                        [Button.inline("关闭", b"src:close")],
+                    ],
+                )
+                await _refresh()
+                return
+
+            if action == "patch":
+                pending[user_id] = PendingTextInput(kind="patchclone", payload={"source_id": source_id})
+                await event.answer("请发送要补的消息链接")
+                await bot_client.send_message(
+                    int(event.chat_id),
+                    f"🔁 补克隆：{source.get('display_title')}\n"
+                    "请直接发送“消息链接/消息ID”，可一次发送多条（每行一条）。\n"
+                    "示例：\n"
+                    "https://t.me/c/3406401277/6779/7304\n"
+                    "https://t.me/c/3406401277/6779/7310\n"
+                    "或：7304\n",
+                    buttons=_reply_menu_keyboard(),
+                )
+                return
+
+            if action == "clonerun":
+                if runtime.is_cloning(source_id):
+                    await event.answer("已在克隆中")
+                    return
+                title = str(source.get("display_title") or f"source_{source_id}")
+                await event.answer("开始克隆…")
                 db.set_download_source_active(source_id, False)
                 runtime.refresh_sources_cache(force=True)
                 task = runtime.start_clone(source_id, auto_listen=True)
@@ -948,17 +995,24 @@ async def main_async() -> None:
                 await _refresh()
                 return
 
-            if action == "clonefrom":
-                pending[user_id] = PendingTextInput(kind="clonefrom", payload={"source_id": source_id})
+            if action == "cloneask":
+                pending[user_id] = PendingTextInput(kind="clone_start", payload={"source_id": source_id})
                 await event.answer("请发送起始消息ID/链接")
                 await bot_client.send_message(
                     int(event.chat_id),
-                    f"补克隆：{source.get('display_title')}\n"
+                    f"🔢 指定起始：{source.get('display_title')}\n"
                     "请发送起始消息 ID（数字）或消息链接（t.me/...）。\n"
-                    "例如：12345\n"
-                    "例如：https://t.me/c/3406401277/12345",
+                    "例如：7304\n"
+                    "例如：https://t.me/c/3406401277/6779/7304\n",
                     buttons=_reply_menu_keyboard(),
                 )
+                return
+
+            if action == "close":
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
                 return
 
             if action == "del":
@@ -1213,7 +1267,7 @@ async def main_async() -> None:
                     )
                     return
 
-                if state.kind == "clonefrom":
+                if state.kind == "clone_start":
                     src_id = int((state.payload or {}).get("source_id") or 0)
                     source = db.get_download_source(src_id)
                     if not source:
@@ -1221,7 +1275,7 @@ async def main_async() -> None:
                         await event.reply("来源不存在", buttons=_reply_menu_keyboard())
                         return
 
-                    chat_hint, msg_id = _parse_message_id_or_link(text)
+                    chat_hint, thread_id, msg_id = _parse_message_ref(text)
                     if msg_id <= 0:
                         raise ValueError("消息 ID 无效")
 
@@ -1237,6 +1291,12 @@ async def main_async() -> None:
                         if _to_telegram_chat_id(raw_id) != int(source["chat_id"]):
                             raise ValueError("该链接不属于当前来源（chat_id 不一致）")
 
+                    # Forum 话题：链接里的 thread_id 必须匹配当前来源 topic_id（如果提供了）
+                    if source["source_type"] == "forum_topic" and thread_id:
+                        topic_id = int(source.get("topic_id") or 0)
+                        if topic_id and int(thread_id) != topic_id:
+                            raise ValueError("该链接不属于当前话题（thread_id 不一致）")
+
                     pending.pop(user_id, None)
                     db.set_download_source_active(src_id, False)
                     runtime.refresh_sources_cache(force=True)
@@ -1244,9 +1304,79 @@ async def main_async() -> None:
                     title = str(source.get("display_title") or f"source_{src_id}")
                     asyncio.create_task(_run_clone_with_progress(int(event.chat_id), src_id, title, task))
                     await event.reply(
-                        f"已开始补克隆：{source.get('display_title')}\n起始消息ID: {msg_id}\n\n完成后会自动开始监听。",
+                        f"已开始克隆：{source.get('display_title')}\n起始消息ID: {msg_id}\n\n完成后会自动开始监听。",
                         buttons=_reply_menu_keyboard(),
                     )
+                    return
+
+                if state.kind == "patchclone":
+                    src_id = int((state.payload or {}).get("source_id") or 0)
+                    source = db.get_download_source(src_id)
+                    if not source:
+                        pending.pop(user_id, None)
+                        await event.reply("来源不存在", buttons=_reply_menu_keyboard())
+                        return
+
+                    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+                    if not lines:
+                        raise ValueError("请至少提供一条消息链接/ID")
+
+                    # 逐条解析并校验归属
+                    msg_ids: List[int] = []
+                    for ln in lines:
+                        chat_hint, thread_id, msg_id = _parse_message_ref(ln)
+                        if msg_id <= 0:
+                            continue
+
+                        if isinstance(chat_hint, int) and int(chat_hint) != int(source["chat_id"]):
+                            raise ValueError("存在不属于当前来源的链接（chat_id 不一致）")
+
+                        if source["source_type"] == "forum_topic" and thread_id:
+                            topic_id = int(source.get("topic_id") or 0)
+                            if topic_id and int(thread_id) != topic_id:
+                                raise ValueError("存在不属于当前话题的链接（thread_id 不一致）")
+
+                        msg_ids.append(int(msg_id))
+
+                    if not msg_ids:
+                        raise ValueError("未解析到有效的消息 ID")
+
+                    pending.pop(user_id, None)
+                    title = str(source.get("display_title") or f"source_{src_id}")
+
+                    # 启动任务（不改变克隆状态，不影响监听开关）
+                    progress_msg = await event.reply(f"🔁 补克隆已提交：0/{len(msg_ids)}\n来源：{title}", buttons=_reply_menu_keyboard())
+
+                    async def _run_patch() -> None:
+                        done = 0
+                        tasks = [asyncio.create_task(runtime.download_group_by_message_id(src_id, mid)) for mid in msg_ids]
+                        for fut in asyncio.as_completed(tasks):
+                            try:
+                                await fut
+                            except Exception:
+                                pass
+                            done += 1
+                            if done % 2 == 0 or done == len(tasks):
+                                try:
+                                    await bot_client.edit_message(
+                                        int(event.chat_id),
+                                        int(progress_msg.id),
+                                        f"🔁 补克隆进行中：{done}/{len(tasks)}\n来源：{title}",
+                                        buttons=_reply_menu_keyboard(),
+                                    )
+                                except Exception:
+                                    pass
+                        try:
+                            await bot_client.edit_message(
+                                int(event.chat_id),
+                                int(progress_msg.id),
+                                f"✅ 补克隆完成：{len(tasks)}/{len(tasks)}\n来源：{title}",
+                                buttons=_reply_menu_keyboard(),
+                            )
+                        except Exception:
+                            pass
+
+                    asyncio.create_task(_run_patch())
                     return
 
                 if state.kind == "addgroup":

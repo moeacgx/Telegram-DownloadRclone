@@ -623,6 +623,64 @@ class DownloaderRuntime:
         self._sources_by_chat = by_chat
         self._sources_cache_ts = now
 
+    async def download_media_messages(self, source_id: int, messages: List, header_text: Optional[str] = None) -> None:
+        source = self._db.get_download_source(int(source_id))
+        if not source:
+            raise RuntimeError("来源不存在")
+        await download_media_group(
+            self._client,
+            self._cfg,
+            self._db,
+            source,
+            messages,
+            self._uploader,
+            download_semaphore=self._download_semaphore,
+            group_semaphore=self._group_semaphore,
+            header_text=header_text,
+        )
+
+    async def download_group_by_message_id(self, source_id: int, message_id: int) -> None:
+        source = self._db.get_download_source(int(source_id))
+        if not source:
+            raise RuntimeError("来源不存在")
+
+        entity = await self._client.get_entity(int(source["chat_id"]))
+        seed = await self._client.get_messages(entity, ids=int(message_id))
+        if not seed:
+            raise RuntimeError("未获取到该消息（可能无权限或消息不存在）")
+
+        topic_root = int(source.get("topic_id") or source.get("topic_root_message_id") or 0)
+        if source["source_type"] == "forum_topic" and topic_root:
+            if not _message_in_topic(seed, topic_root):
+                raise RuntimeError("该消息不属于当前话题")
+
+        if not getattr(seed, "media", None):
+            raise RuntimeError("该消息不是媒体消息")
+
+        gid = getattr(seed, "grouped_id", None)
+        messages: List = [seed]
+        if gid:
+            window_min = max(0, int(seed.id) - 300)
+            window_max = int(seed.id) + 300
+            uniq: Dict[int, object] = {int(seed.id): seed}
+            async for m in self._client.iter_messages(
+                entity,
+                min_id=window_min,
+                max_id=window_max,
+                reverse=True,
+                reply_to=None,
+            ):
+                if not getattr(m, "media", None):
+                    continue
+                if source["source_type"] == "forum_topic" and topic_root:
+                    if not _message_in_topic(m, topic_root):
+                        continue
+                if getattr(m, "grouped_id", None) == gid:
+                    uniq[int(m.id)] = m
+            messages = [uniq[k] for k in sorted(uniq.keys())]
+
+        await self.download_media_messages(int(source_id), messages, header_text=None)
+
     async def _on_new_message(self, event) -> None:
         message = event.message
 
