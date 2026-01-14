@@ -128,6 +128,7 @@ class AppConfig:
     download_root_dir: Path
     media_group_flush_seconds: float
     max_download_concurrency: int
+    max_group_concurrency: int
     rclone_enabled: bool
     rclone_remote: Optional[str]
     rclone_remote_base_dir: Optional[str]
@@ -149,6 +150,8 @@ def load_config() -> AppConfig:
     flush_seconds = _env_float("MEDIA_GROUP_FLUSH_SECONDS", 2.0)
     max_download = int(_env_int("MAX_DOWNLOAD_CONCURRENCY", 5) or 5)
     max_download = max(1, min(30, max_download))
+    max_groups = int(_env_int("MAX_GROUP_CONCURRENCY", max_download) or max_download)
+    max_groups = max(1, min(50, max_groups))
 
     rclone_enabled = _env_bool("RCLONE_ENABLED", False)
     rclone_remote = _env_str("RCLONE_REMOTE")
@@ -168,6 +171,7 @@ def load_config() -> AppConfig:
         download_root_dir=Path(download_root),
         media_group_flush_seconds=float(flush_seconds),
         max_download_concurrency=int(max_download),
+        max_group_concurrency=int(max_groups),
         rclone_enabled=rclone_enabled,
         rclone_remote=rclone_remote,
         rclone_remote_base_dir=rclone_base,
@@ -357,6 +361,7 @@ async def download_media_group(
     messages: List,
     uploader: RcloneUploader,
     download_semaphore: Optional[asyncio.Semaphore] = None,
+    group_semaphore: Optional[asyncio.Semaphore] = None,
     header_text: Optional[str] = None,
 ) -> None:
     if not messages:
@@ -365,11 +370,13 @@ async def download_media_group(
     if not any(getattr(m, "media", None) for m in messages):
         return
 
-    prepared = _prepare_download_group(cfg, db, source_row, messages, header_text=header_text)
-    if not prepared:
-        return
-
+    if group_semaphore is not None:
+        await group_semaphore.acquire()
     try:
+        prepared = _prepare_download_group(cfg, db, source_row, messages, header_text=header_text)
+        if not prepared:
+            return
+
         sem = download_semaphore or asyncio.Semaphore(cfg.max_download_concurrency)
 
         async def _download_one(msg) -> None:
@@ -429,6 +436,12 @@ async def download_media_group(
             error_message=str(e),
         )
         logger.error(f"下载失败: {e}", exc_info=True)
+    finally:
+        if group_semaphore is not None:
+            try:
+                group_semaphore.release()
+            except Exception:
+                pass
 
 
 def _prepare_download_group(
@@ -508,6 +521,7 @@ class DownloaderRuntime:
         self._db = db
         self._uploader = RcloneUploader(cfg, db)
         self._download_semaphore = asyncio.Semaphore(int(cfg.max_download_concurrency))
+        self._group_semaphore = asyncio.Semaphore(int(cfg.max_group_concurrency))
 
         self._collector = MediaGroupCollector(
             flush_seconds=cfg.media_group_flush_seconds,
@@ -622,6 +636,7 @@ class DownloaderRuntime:
             messages,
             self._uploader,
             download_semaphore=self._download_semaphore,
+            group_semaphore=self._group_semaphore,
             header_text=header_text,
         )
 
@@ -710,6 +725,7 @@ class DownloaderRuntime:
                 source,
                 self._uploader,
                 download_semaphore=self._download_semaphore,
+                group_semaphore=self._group_semaphore,
                 start_from_message_id=start_from_message_id,
                 progress_hook=on_group_done,
             )
@@ -722,6 +738,7 @@ class DownloaderRuntime:
                 source2,
                 self._uploader,
                 download_semaphore=self._download_semaphore,
+                group_semaphore=self._group_semaphore,
                 start_from_message_id=None,
                 progress_hook=on_group_done,
             )
@@ -783,6 +800,7 @@ async def backfill_sources(
             source,
             uploader,
             download_semaphore=download_semaphore,
+            group_semaphore=None,
             start_from_message_id=None,
         )
 
@@ -794,6 +812,7 @@ async def backfill_single_source(
     source: dict,
     uploader: RcloneUploader,
     download_semaphore: Optional[asyncio.Semaphore] = None,
+    group_semaphore: Optional[asyncio.Semaphore] = None,
     start_from_message_id: Optional[int] = None,
     progress_hook: Optional[Callable[[int], None]] = None,
 ) -> None:
@@ -819,7 +838,7 @@ async def backfill_single_source(
     last_header_text: Optional[str] = None
 
     inflight: Set[asyncio.Task] = set()
-    max_inflight_groups = max(5, int(cfg.max_download_concurrency) * 4)
+    max_inflight_groups = max(5, int(cfg.max_group_concurrency) * 2)
 
     async def _drain_inflight_if_needed() -> None:
         nonlocal inflight
@@ -865,6 +884,7 @@ async def backfill_single_source(
                 messages_snapshot,
                 uploader,
                 download_semaphore=download_semaphore,
+                group_semaphore=group_semaphore,
                 header_text=header_snapshot,
             )
         )

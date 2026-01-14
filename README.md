@@ -20,7 +20,8 @@
 
 常用参数说明（都在 `.env.example` 里）：  
 - `MEDIA_GROUP_FLUSH_SECONDS`：相册（`grouped_id`）聚合等待时间  
-- `MAX_DOWNLOAD_CONCURRENCY`：同时下载的媒体消息数量（全局并发；相册/单条媒体都按“消息数”计）
+- `MAX_DOWNLOAD_CONCURRENCY`：同时下载的媒体消息数量（消息级并发；相册/单条媒体都按“消息数”计）
+- `MAX_GROUP_CONCURRENCY`：同时处理的媒体组数量（组级并发；控制同时创建多少组目录/同时跑多少组任务）
 
 2) 首次登录生成会话：
 
