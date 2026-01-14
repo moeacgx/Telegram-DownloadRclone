@@ -464,3 +464,30 @@ class Database:
         counts = {str(r[0]): int(r[1]) for r in rows}
         counts["total"] = int(sum(counts.values()))
         return counts
+
+    def get_download_group(self, source_id: int, group_uid: str) -> Optional[dict]:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT source_id, group_uid, date, seq, last_message_id, local_dir, remote_dir, status, error_message, local_deleted
+            FROM download_groups
+            WHERE source_id=? AND group_uid=?
+            LIMIT 1
+            """,
+            (int(source_id), str(group_uid)),
+        )
+        r = cursor.fetchone()
+        if not r:
+            return None
+        return {
+            "source_id": int(r[0]),
+            "group_uid": str(r[1]),
+            "date": str(r[2]),
+            "seq": int(r[3]),
+            "last_message_id": int(r[4] or 0),
+            "local_dir": r[5],
+            "remote_dir": r[6],
+            "status": str(r[7]),
+            "error_message": r[8],
+            "local_deleted": bool(r[9]),
+        }

@@ -461,8 +461,47 @@ def _prepare_download_group(
     grouped_id = getattr(messages[0], "grouped_id", None)
 
     group_uid = build_group_uid(chat_id, topic_root_message_id, grouped_id, messages[0].id)
-    if db.download_group_exists(source_row["id"], group_uid):
-        return None
+    existing = db.get_download_group(int(source_row["id"]), str(group_uid))
+    if existing:
+        # 已成功的组直接跳过；失败的组允许重试，但复用原有 seq/目录，避免编号跳号
+        if str(existing.get("status")) != "failed":
+            return None
+
+        date_str = str(existing.get("date") or "")
+        seq = int(existing.get("seq") or 0)
+        local_dir_raw = existing.get("local_dir")
+        local_dir = Path(str(local_dir_raw)) if local_dir_raw else None
+
+        if not date_str:
+            text_for_date = header_text or _pick_text_for_date(messages)
+            date_str = extract_date_yyyy_mm_dd(text_for_date, messages[0].date)
+
+        if seq <= 0:
+            seq = db.get_next_download_seq(source_row["id"], date_str)
+
+        group_folder = local_dir.name if local_dir else f"TG@BieLaoZai_{seq:03d}"
+
+        source_title = sanitize_path_component(source_row.get("display_title") or f"chat_{abs(chat_id)}")
+        if local_dir is None:
+            local_dir = cfg.download_root_dir / source_title / date_str / group_folder
+        local_dir.mkdir(parents=True, exist_ok=True)
+
+        remote_dir = existing.get("remote_dir")
+        if cfg.rclone_enabled and not remote_dir:
+            remote_base = cfg.rclone_remote_base_dir.strip("/\\") if cfg.rclone_remote_base_dir else ""
+            remote_rel = "/".join(part for part in [remote_base, source_title, date_str, group_folder] if part)
+            remote_dir = f"{cfg.rclone_remote}{remote_rel}"
+
+        last_message_id = max(int(m.id) for m in messages)
+        return PreparedDownloadGroup(
+            group_uid=str(group_uid),
+            date_str=str(date_str),
+            seq=int(seq),
+            group_folder=str(group_folder),
+            local_dir=local_dir,
+            remote_dir=str(remote_dir) if remote_dir else None,
+            last_message_id=int(last_message_id),
+        )
 
     text_for_date = header_text or _pick_text_for_date(messages)
     date_str = extract_date_yyyy_mm_dd(text_for_date, messages[0].date)

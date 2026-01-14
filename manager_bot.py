@@ -308,7 +308,7 @@ def generate_source_list_message(db: Database, runtime: DownloaderRuntime) -> tu
             [
                 Button.inline(toggle_label, f"src:toggle:{source_id}".encode("utf-8")),
                 Button.inline("📦 克隆", f"src:clone:{source_id}".encode("utf-8")),
-                Button.inline("🔁 补克隆", f"src:clonefrom:{source_id}".encode("utf-8")),
+                Button.inline("🔁 从指定ID", f"src:clonefrom:{source_id}".encode("utf-8")),
                 Button.inline("🗑️ 删除", f"src:del:{source_id}".encode("utf-8")),
             ]
         )
@@ -932,7 +932,7 @@ async def main_async() -> None:
                     return
 
                 title = str(source.get("display_title") or f"source_{source_id}")
-                await event.answer("开始克隆…")
+                await event.answer("开始克隆…（如需从指定消息开始，请点“从指定ID”）")
                 db.set_download_source_active(source_id, False)
                 runtime.refresh_sources_cache(force=True)
                 task = runtime.start_clone(source_id, auto_listen=True)
