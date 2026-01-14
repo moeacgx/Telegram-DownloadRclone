@@ -377,7 +377,7 @@ async def download_media_group(
                 return
             await sem.acquire()
             try:
-                await client.download_media(msg, file=str(local_dir))
+                await client.download_media(msg, file=str(prepared.local_dir))
             finally:
                 sem.release()
 
