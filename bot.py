@@ -775,12 +775,23 @@ class DownloaderRuntime:
         if not source:
             raise RuntimeError("来源不存在")
 
+        if start_from_message_id is not None:
+            start_from = int(start_from_message_id)
+            if start_from > 0:
+                current_last = int(source.get("last_message_id") or 0)
+                if start_from <= current_last:
+                    # 起始ID小于等于已记录 last_message_id：先重置，确保“从更早位置重新克隆”语义一致
+                    self._db.set_download_source_last_message(source_id, max(0, start_from - 1))
+                    source = self._db.get_download_source(source_id) or source
+
         self._update_clone_progress(
             source_id,
             status="starting",
             started_at=float(time.time()),
             groups_done=0,
-            current_message_id=int(source.get("last_message_id") or 0),
+            current_message_id=max(0, int(start_from_message_id or 0) - 1)
+            if start_from_message_id is not None
+            else int(source.get("last_message_id") or 0),
             latest_message_id=0,
             start_from_message_id=int(start_from_message_id or 0),
         )

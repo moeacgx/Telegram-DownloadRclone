@@ -1305,6 +1305,18 @@ async def main_async() -> None:
                             raise ValueError("该链接不属于当前话题（thread_id 不一致）")
 
                     pending.pop(user_id, None)
+                    # 如果起始ID小于已记录 last_message_id，则先重置进度（否则会看起来“没从指定ID开始”）
+                    prev_last = int(source.get("last_message_id") or 0)
+                    if int(msg_id) <= prev_last:
+                        db.set_download_source_last_message(src_id, max(0, int(msg_id) - 1))
+                        runtime.refresh_sources_cache(force=True)
+                        try:
+                            await event.reply(
+                                f"已重置克隆起点：last_message_id {prev_last} -> {max(0, int(msg_id) - 1)}",
+                                buttons=_reply_menu_keyboard(),
+                            )
+                        except Exception:
+                            pass
                     db.set_download_source_active(src_id, False)
                     runtime.refresh_sources_cache(force=True)
                     task = runtime.start_clone(src_id, auto_listen=True, start_from_message_id=msg_id)

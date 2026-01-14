@@ -315,6 +315,20 @@ class Database:
         self.conn.commit()
         return cursor.rowcount > 0
 
+    def set_download_source_last_message(self, source_id: int, last_message_id: int) -> bool:
+        """强制设置 last_message_id（允许回退，用于从较小 ID 重新克隆）。"""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            UPDATE download_sources
+            SET last_message_id=?, updated_at=CURRENT_TIMESTAMP
+            WHERE id=?
+            """,
+            (int(last_message_id), int(source_id)),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
     def delete_download_source(self, source_id: int) -> bool:
         cursor = self.conn.cursor()
         cursor.execute("DELETE FROM download_sources WHERE id=?", (int(source_id),))
