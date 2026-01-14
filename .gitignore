@@ -1,0 +1,62 @@
+# 会话文件
+sessions/
+*.session
+*.session-journal
+
+# 数据库
+data/
+*.db
+*.db-journal
+
+# 日志
+logs/
+*.log
+
+# 配置文件（包含敏感信息）
+config.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+.venv/
+ENV/
+env/
+venv/
+media_cache/
+.pytest_cache/
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+.serena
+.claude
+.env
+.env.*
+!.env.example
+
