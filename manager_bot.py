@@ -270,7 +270,25 @@ def generate_source_list_message(db: Database, runtime: DownloaderRuntime) -> tu
         source_id = int(source["id"])
         title = str(source.get("display_title") or f"source_{source_id}")
         status_icon = "✅" if source.get("is_active") else "⏸️"
-        clone_text = "📦 克隆中" if runtime.is_cloning(source_id) else "📦 可克隆"
+        clone_text = "📦 可克隆"
+        if runtime.is_cloning(source_id):
+            prog = None
+            try:
+                prog = runtime.get_clone_progress(source_id)
+            except Exception:
+                prog = None
+            if prog:
+                cur = int(prog.get("current_message_id") or source.get("last_message_id") or 0)
+                latest = int(prog.get("latest_message_id") or 0)
+                groups_done = int(prog.get("groups_done") or 0)
+                if latest > 0 and cur > 0:
+                    clone_text = f"📦 克隆中: {cur}/{latest}（组 {groups_done}）"
+                elif cur > 0:
+                    clone_text = f"📦 克隆中: 到 {cur}（组 {groups_done}）"
+                else:
+                    clone_text = "📦 克隆中"
+            else:
+                clone_text = "📦 克隆中"
         counts = db.count_download_groups_by_status(source_id)
         failed = int(counts.get("failed", 0))
         total = int(counts.get("total", 0))

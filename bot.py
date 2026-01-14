@@ -442,6 +442,7 @@ class DownloaderRuntime:
         self._sources_by_chat: Dict[int, List[dict]] = {}
 
         self._clone_tasks: Dict[int, asyncio.Task] = {}
+        self._clone_progress: Dict[int, dict] = {}
         self._handler_installed = False
 
     def start(self) -> None:
@@ -467,6 +468,17 @@ class DownloaderRuntime:
     def is_cloning(self, source_id: int) -> bool:
         task = self._clone_tasks.get(int(source_id))
         return bool(task and not task.done())
+
+    def get_clone_progress(self, source_id: int) -> Optional[dict]:
+        p = self._clone_progress.get(int(source_id))
+        return dict(p) if p else None
+
+    def _update_clone_progress(self, source_id: int, **fields) -> None:
+        source_id = int(source_id)
+        current = self._clone_progress.get(source_id) or {}
+        current.update(fields)
+        current["updated_at"] = float(time.time())
+        self._clone_progress[source_id] = current
 
     def refresh_sources_cache(self, force: bool = False) -> None:
         now = time.monotonic()
@@ -527,6 +539,13 @@ class DownloaderRuntime:
         existing = self._clone_tasks.get(source_id)
         if existing and not existing.done():
             return existing
+
+        self._update_clone_progress(
+            source_id,
+            status="queued",
+            start_from_message_id=int(start_from_message_id or 0),
+        )
+
         task = asyncio.create_task(
             self.clone_source(
                 source_id,
@@ -548,9 +567,46 @@ class DownloaderRuntime:
         if not source:
             raise RuntimeError("来源不存在")
 
+        self._update_clone_progress(
+            source_id,
+            status="starting",
+            started_at=float(time.time()),
+            groups_done=0,
+            current_message_id=int(source.get("last_message_id") or 0),
+            latest_message_id=0,
+            start_from_message_id=int(start_from_message_id or 0),
+        )
+
         # 克隆期间暂停监听，避免并发重复下载；完成后再开启监听
         self._db.set_download_source_active(source_id, False)
         try:
+            # 预估最新消息ID（用于进度展示）
+            try:
+                entity = await self._client.get_entity(int(source["chat_id"]))
+                reply_to = None
+                if source["source_type"] == "forum_topic" and source.get("topic_root_message_id"):
+                    reply_to = int(source["topic_root_message_id"])
+
+                latest_id = 0
+                async for m in self._client.iter_messages(entity, limit=1, reply_to=reply_to):
+                    latest_id = int(getattr(m, "id", 0) or 0)
+                    break
+                self._update_clone_progress(source_id, latest_message_id=latest_id)
+            except Exception as e:
+                self._update_clone_progress(source_id, latest_message_id=0, latest_error=str(e))
+
+            groups_done = 0
+
+            def on_group_done(group_last_message_id: int) -> None:
+                nonlocal groups_done
+                groups_done += 1
+                self._update_clone_progress(
+                    source_id,
+                    status="running",
+                    groups_done=groups_done,
+                    current_message_id=int(group_last_message_id or 0),
+                )
+
             await backfill_single_source(
                 self._client,
                 self._cfg,
@@ -559,6 +615,7 @@ class DownloaderRuntime:
                 self._uploader,
                 download_semaphore=self._download_semaphore,
                 start_from_message_id=start_from_message_id,
+                progress_hook=on_group_done,
             )
             # 再跑一次兜底 catch-up，降低“克隆过程中新增消息漏掉”的概率
             source2 = self._db.get_download_source(source_id) or source
@@ -570,7 +627,13 @@ class DownloaderRuntime:
                 self._uploader,
                 download_semaphore=self._download_semaphore,
                 start_from_message_id=None,
+                progress_hook=on_group_done,
             )
+
+            self._update_clone_progress(source_id, status="done", finished_at=float(time.time()))
+        except Exception as e:
+            self._update_clone_progress(source_id, status="failed", last_error=str(e), finished_at=float(time.time()))
+            logger.error(f"克隆失败: source={source_id} err={e}", exc_info=True)
         finally:
             if auto_listen:
                 self._db.set_download_source_active(source_id, True)
@@ -636,6 +699,7 @@ async def backfill_single_source(
     uploader: RcloneUploader,
     download_semaphore: Optional[asyncio.Semaphore] = None,
     start_from_message_id: Optional[int] = None,
+    progress_hook: Optional[Callable[[int], None]] = None,
 ) -> None:
     chat_id = int(source["chat_id"])
     last_message_id = int(source.get("last_message_id") or 0)
@@ -676,6 +740,12 @@ async def backfill_single_source(
                 uploader,
                 download_semaphore=download_semaphore,
             )
+            if progress_hook and pending_messages:
+                try:
+                    progress_hook(int(max(m.id for m in pending_messages)))
+                except Exception:
+                    pass
+
             pending_messages = []
             pending_group_key = group_key
 
@@ -691,6 +761,11 @@ async def backfill_single_source(
             uploader,
             download_semaphore=download_semaphore,
         )
+        if progress_hook:
+            try:
+                progress_hook(int(max(m.id for m in pending_messages)))
+            except Exception:
+                pass
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
