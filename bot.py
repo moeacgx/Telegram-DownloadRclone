@@ -363,6 +363,7 @@ async def download_media_group(
     download_semaphore: Optional[asyncio.Semaphore] = None,
     group_semaphore: Optional[asyncio.Semaphore] = None,
     header_text: Optional[str] = None,
+    prepared: Optional[PreparedDownloadGroup] = None,
 ) -> None:
     if not messages:
         return
@@ -372,10 +373,14 @@ async def download_media_group(
 
     if group_semaphore is not None:
         await group_semaphore.acquire()
+    prepared_group: Optional[PreparedDownloadGroup] = prepared
     try:
-        prepared = _prepare_download_group(cfg, db, source_row, messages, header_text=header_text)
-        if not prepared:
+        if prepared_group is None:
+            prepared_group = _prepare_download_group(cfg, db, source_row, messages, header_text=header_text)
+        if not prepared_group:
             return
+
+        prepared_group.local_dir.mkdir(parents=True, exist_ok=True)
 
         sem = download_semaphore or asyncio.Semaphore(cfg.max_download_concurrency)
 
@@ -384,7 +389,7 @@ async def download_media_group(
                 return
             await sem.acquire()
             try:
-                await client.download_media(msg, file=str(prepared.local_dir))
+                await client.download_media(msg, file=str(prepared_group.local_dir))
             finally:
                 sem.release()
 
@@ -392,49 +397,53 @@ async def download_media_group(
 
         db.add_download_group(
             source_id=source_row["id"],
-            group_uid=prepared.group_uid,
-            date=prepared.date_str,
-            seq=prepared.seq,
-            last_message_id=prepared.last_message_id,
-            local_dir=str(prepared.local_dir),
-            remote_dir=prepared.remote_dir,
+            group_uid=prepared_group.group_uid,
+            date=prepared_group.date_str,
+            seq=prepared_group.seq,
+            last_message_id=prepared_group.last_message_id,
+            local_dir=str(prepared_group.local_dir),
+            remote_dir=prepared_group.remote_dir,
             status="downloaded",
         )
 
-        db.update_download_source_last_message(source_row["id"], prepared.last_message_id)
+        db.update_download_source_last_message(source_row["id"], prepared_group.last_message_id)
         logger.info(
-            f"下载完成: source={source_row['id']} date={prepared.date_str} seq={prepared.seq:03d} last={prepared.last_message_id}"
+            f"下载完成: source={source_row['id']} date={prepared_group.date_str} seq={prepared_group.seq:03d} last={prepared_group.last_message_id}"
         )
 
-        if cfg.rclone_enabled and prepared.remote_dir:
-            await uploader.enqueue(source_row["id"], prepared.group_uid, prepared.local_dir, prepared.remote_dir)
+        if cfg.rclone_enabled and prepared_group.remote_dir:
+            await uploader.enqueue(
+                source_row["id"], prepared_group.group_uid, prepared_group.local_dir, prepared_group.remote_dir
+            )
 
     except FloodWaitError as e:
-        db.add_download_group(
-            source_id=source_row["id"],
-            group_uid=prepared.group_uid,
-            date=prepared.date_str,
-            seq=prepared.seq,
-            last_message_id=prepared.last_message_id,
-            local_dir=str(prepared.local_dir),
-            remote_dir=prepared.remote_dir,
-            status="failed",
-            error_message=f"FloodWait: {e}",
-        )
+        if prepared_group:
+            db.add_download_group(
+                source_id=source_row["id"],
+                group_uid=prepared_group.group_uid,
+                date=prepared_group.date_str,
+                seq=prepared_group.seq,
+                last_message_id=prepared_group.last_message_id,
+                local_dir=str(prepared_group.local_dir),
+                remote_dir=prepared_group.remote_dir,
+                status="failed",
+                error_message=f"FloodWait: {e}",
+            )
         logger.warning(f"触发 FloodWait，等待 {e.seconds}s")
         await asyncio.sleep(int(e.seconds))
     except Exception as e:
-        db.add_download_group(
-            source_id=source_row["id"],
-            group_uid=prepared.group_uid,
-            date=prepared.date_str,
-            seq=prepared.seq,
-            last_message_id=prepared.last_message_id,
-            local_dir=str(prepared.local_dir),
-            remote_dir=prepared.remote_dir,
-            status="failed",
-            error_message=str(e),
-        )
+        if prepared_group:
+            db.add_download_group(
+                source_id=source_row["id"],
+                group_uid=prepared_group.group_uid,
+                date=prepared_group.date_str,
+                seq=prepared_group.seq,
+                last_message_id=prepared_group.last_message_id,
+                local_dir=str(prepared_group.local_dir),
+                remote_dir=prepared_group.remote_dir,
+                status="failed",
+                error_message=str(e),
+            )
         logger.error(f"下载失败: {e}", exc_info=True)
     finally:
         if group_semaphore is not None:
@@ -472,8 +481,16 @@ def _prepare_download_group(
         local_dir_raw = existing.get("local_dir")
         local_dir = Path(str(local_dir_raw)) if local_dir_raw else None
 
+        text_for_date = header_text or _pick_text_for_date(messages)
+        # 失败重试时：如果能从文本中提取到日期且与旧日期不同，则以新日期为准（旧数据可能是 fallback 到消息时间导致）
+        if DATE_RE.search(text_for_date or ""):
+            extracted_date = extract_date_yyyy_mm_dd(text_for_date, messages[0].date)
+            if extracted_date and extracted_date != date_str:
+                date_str = extracted_date
+                seq = 0
+                local_dir = None
+
         if not date_str:
-            text_for_date = header_text or _pick_text_for_date(messages)
             date_str = extract_date_yyyy_mm_dd(text_for_date, messages[0].date)
 
         if seq <= 0:
@@ -484,7 +501,6 @@ def _prepare_download_group(
         source_title = sanitize_path_component(source_row.get("display_title") or f"chat_{abs(chat_id)}")
         if local_dir is None:
             local_dir = cfg.download_root_dir / source_title / date_str / group_folder
-        local_dir.mkdir(parents=True, exist_ok=True)
 
         remote_dir = existing.get("remote_dir")
         if cfg.rclone_enabled and not remote_dir:
@@ -493,6 +509,22 @@ def _prepare_download_group(
             remote_dir = f"{cfg.rclone_remote}{remote_rel}"
 
         last_message_id = max(int(m.id) for m in messages)
+        # 如果我们上面修正过 date/seq/local_dir，则把元数据先写回，避免下次重试仍走旧日期
+        try:
+            if str(existing.get("date") or "") != str(date_str) or int(existing.get("seq") or 0) != int(seq):
+                db.add_download_group(
+                    source_id=source_row["id"],
+                    group_uid=str(group_uid),
+                    date=str(date_str),
+                    seq=int(seq),
+                    last_message_id=int(last_message_id),
+                    local_dir=str(local_dir),
+                    remote_dir=str(remote_dir) if remote_dir else None,
+                    status="failed",
+                    error_message=str(existing.get("error_message") or "").strip() or None,
+                )
+        except Exception:
+            pass
         return PreparedDownloadGroup(
             group_uid=str(group_uid),
             date_str=str(date_str),
@@ -511,7 +543,6 @@ def _prepare_download_group(
 
     source_title = sanitize_path_component(source_row.get("display_title") or f"chat_{abs(chat_id)}")
     local_dir = cfg.download_root_dir / source_title / date_str / group_folder
-    local_dir.mkdir(parents=True, exist_ok=True)
 
     remote_dir = None
     if cfg.rclone_enabled:
@@ -972,6 +1003,8 @@ async def backfill_single_source(
             _reset_pending()
             return
 
+        await _drain_inflight_if_needed()
+
         messages_snapshot = list(pending_messages)
         header_snapshot = pending_header_text
         last_id = int(max(m.id for m in messages_snapshot))
@@ -982,6 +1015,11 @@ async def backfill_single_source(
                 progress_hook(last_id)
             except Exception:
                 pass
+
+        # 这里按“消息遍历顺序”预分配日期/编号，避免并发导致 TG@BieLaoZai_002/009 这种乱序编号
+        prepared = _prepare_download_group(cfg, db, source, messages_snapshot, header_text=header_snapshot)
+        if not prepared:
+            return
 
         task = asyncio.create_task(
             download_media_group(
@@ -994,6 +1032,7 @@ async def backfill_single_source(
                 download_semaphore=download_semaphore,
                 group_semaphore=group_semaphore,
                 header_text=header_snapshot,
+                prepared=prepared,
             )
         )
         inflight.add(task)
@@ -1008,6 +1047,11 @@ async def backfill_single_source(
         # 标题/说明文本：用于后续媒体组抽取日期
         if (not has_media) and msg_text:
             last_header_text = msg_text
+            # 有些话题是“先发媒体组，后补一条文字标题/日期”，这里把后补标题绑定给当前 pending 组
+            if pending_group_key is not None and pending_messages:
+                if (not pending_header_text) or (DATE_RE.search(pending_header_text or "") is None):
+                    if DATE_RE.search(msg_text):
+                        pending_header_text = msg_text
             return
 
         if not has_media:
