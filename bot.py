@@ -200,6 +200,24 @@ def sanitize_path_component(name: str) -> str:
     return sanitized
 
 
+def ensure_empty_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        children = list(path.iterdir())
+    except FileNotFoundError:
+        path.mkdir(parents=True, exist_ok=True)
+        return
+
+    for child in children:
+        try:
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=False)
+            else:
+                child.unlink(missing_ok=True)
+        except Exception:
+            continue
+
+
 def extract_date_yyyy_mm_dd(text: str, fallback_dt: datetime) -> str:
     match = DATE_RE.search(text or "")
     if match:
@@ -380,7 +398,8 @@ async def download_media_group(
         if not prepared_group:
             return
 
-        prepared_group.local_dir.mkdir(parents=True, exist_ok=True)
+        # 重启/重试时如果目录已存在，Telethon 会自动重命名(1)(2)...；这里直接清空目录实现“覆盖替换”
+        ensure_empty_dir(prepared_group.local_dir)
 
         sem = download_semaphore or asyncio.Semaphore(cfg.max_download_concurrency)
 
