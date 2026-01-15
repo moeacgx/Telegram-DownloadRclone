@@ -79,8 +79,8 @@ def build_proxy(config):
 
         if socks is None:
             print("⚠️ 代理已启用但未安装 PySocks")
-            print("运行: pip install pysocks")
-            return None
+            print("运行: python -m pip install -r requirements.txt")
+            sys.exit(1)
 
         def map_type(t):
             t = (t or '').lower()

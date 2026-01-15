@@ -329,6 +329,19 @@ class Database:
         self.conn.commit()
         return cursor.rowcount > 0
 
+    def set_download_source_display_title(self, source_id: int, display_title: str) -> bool:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            UPDATE download_sources
+            SET display_title=?, updated_at=CURRENT_TIMESTAMP
+            WHERE id=?
+            """,
+            (str(display_title), int(source_id)),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
     def delete_download_source(self, source_id: int) -> bool:
         cursor = self.conn.cursor()
         cursor.execute("DELETE FROM download_sources WHERE id=?", (int(source_id),))
@@ -505,3 +518,21 @@ class Database:
             "error_message": r[8],
             "local_deleted": bool(r[9]),
         }
+
+    def clear_failed_download_groups(self, source_id: int) -> None:
+        """清理指定来源的失败下载记录，避免重启后显示旧的失败数据"""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "DELETE FROM download_groups WHERE source_id = ? AND status = 'failed'",
+            (int(source_id),)
+        )
+        self.conn.commit()
+
+    def delete_download_group(self, source_id: int, group_uid: str) -> bool:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "DELETE FROM download_groups WHERE source_id = ? AND group_uid = ?",
+            (int(source_id), str(group_uid)),
+        )
+        self.conn.commit()
+        return int(getattr(cursor, "rowcount", 0) or 0) > 0

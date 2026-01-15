@@ -14,7 +14,7 @@
 
 说明：
 - 序号按“来源+日期”递增（001/002/...）
-- 日期优先从消息文本/标题中提取 `YYYY年MM月DD日`，否则回退消息发送日期
+- 日期仅从消息文本/标题中提取 `YYYY年MM月DD日`，不再回退到消息发送日期
 """
 
 from __future__ import annotations
@@ -25,7 +25,6 @@ import logging
 import logging.handlers
 import os
 import re
-import secrets
 import shutil
 import sys
 import time
@@ -41,17 +40,24 @@ try:
 except ImportError:
     socks = None
 
-from telethon import TelegramClient, events, functions
+from telethon import TelegramClient, events, functions, errors
 from telethon.errors import FloodWaitError
 
 from database import Database
 
 logger = logging.getLogger(__name__)
 
-DATE_RE = re.compile(r"(\d{4})年(\d{1,2})月(\d{1,2})日")
+DATE_RE = re.compile(
+    r"(?:(?P<y1>\d{4})年(?P<m1>\d{1,2})月(?P<d1>\d{1,2})日)"
+    r"|(?:(?P<y2>\d{4})[./-](?P<m2>\d{1,2})[./-](?P<d2>\d{1,2}))"
+)
 
 _TELETHON_DEDUP_LAST_TS: Dict[str, float] = {}
 _ACTIVE_MEDIA_DOWNLOADS = 0
+
+
+def has_active_media_downloads() -> bool:
+    return int(_ACTIVE_MEDIA_DOWNLOADS) > 0
 
 
 @dataclass(frozen=True)
@@ -99,13 +105,30 @@ def _env_float(name: str, default: float) -> float:
         raise ValueError(f"环境变量 {name} 必须是数字")
 
 
+def normalize_rclone_remote(remote: Optional[str]) -> Optional[str]:
+    if remote is None:
+        return None
+    r = str(remote).strip()
+    if not r:
+        return None
+    return r if r.endswith(":") else f"{r}:"
+
+
+def is_valid_rclone_remote_path(path: Optional[str]) -> bool:
+    if not path:
+        return False
+    return re.match(r"^[A-Za-z0-9_\\-]+:", str(path)) is not None
+
+
 def build_proxy() -> Optional[Tuple[int, str, int, bool, Optional[str], Optional[str]]]:
     if not _env_bool("PROXY_ENABLED", False):
         return None
 
     if socks is None:
-        logger.warning("代理已启用但未安装 PySocks（pysocks）")
-        return None
+        raise RuntimeError(
+            "代理已启用但未安装 PySocks（pysocks）。请运行：python -m pip install -r requirements.txt；"
+            "或将 PROXY_ENABLED=false 关闭代理。"
+        )
 
     proxy_type_raw = (_env_str("PROXY_TYPE", "socks5") or "socks5").lower()
     if proxy_type_raw == "socks5":
@@ -138,11 +161,16 @@ class AppConfig:
     rclone_remote: Optional[str]
     rclone_remote_base_dir: Optional[str]
     rclone_delete_local_after_upload: bool
+    rclone_cleanup_db_after_upload: bool
     rclone_extra_args: List[str]
 
 
 def load_config() -> AppConfig:
     load_dotenv()
+    try:
+        import cryptg  # noqa: F401
+    except Exception:
+        logger.warning("未安装 cryptg，Telethon 将使用纯 Python AES，下载可能很慢；请在 venv 中安装 cryptg。")
 
     api_id = _env_int("API_ID")
     api_hash = _env_str("API_HASH")
@@ -159,9 +187,10 @@ def load_config() -> AppConfig:
     max_groups = max(1, min(50, max_groups))
 
     rclone_enabled = _env_bool("RCLONE_ENABLED", False)
-    rclone_remote = _env_str("RCLONE_REMOTE")
+    rclone_remote = normalize_rclone_remote(_env_str("RCLONE_REMOTE"))
     rclone_base = _env_str("RCLONE_REMOTE_BASE_DIR")
     rclone_delete = _env_bool("RCLONE_DELETE_LOCAL_AFTER_UPLOAD", True)
+    rclone_cleanup_db_after_upload = _env_bool("RCLONE_CLEANUP_DB_AFTER_UPLOAD", True)
 
     extra_args_raw = _env_str("RCLONE_EXTRA_ARGS", "")
     rclone_extra_args = [arg for arg in (extra_args_raw or "").split() if arg.strip()]
@@ -181,6 +210,7 @@ def load_config() -> AppConfig:
         rclone_remote=rclone_remote,
         rclone_remote_base_dir=rclone_base,
         rclone_delete_local_after_upload=rclone_delete,
+        rclone_cleanup_db_after_upload=rclone_cleanup_db_after_upload,
         rclone_extra_args=rclone_extra_args,
     )
 
@@ -235,6 +265,18 @@ def should_log_each_download_message() -> bool:
     return _env_bool("LOG_DOWNLOAD_EACH_MESSAGE", False)
 
 
+def should_log_rclone_command() -> bool:
+    return _env_bool("LOG_RCLONE_COMMAND", False)
+
+
+def resolve_rclone_executable() -> str:
+    if Path("./rclone.exe").exists():
+        return str(Path("./rclone.exe"))
+    if Path("./rclone").exists():
+        return str(Path("./rclone"))
+    return "rclone"
+
+
 def _apply_third_party_log_levels() -> None:
     level_str = (_env_str("LOG_TELETHON_LEVEL", "WARNING") or "WARNING").strip().upper()
     level = getattr(logging, level_str, logging.WARNING)
@@ -281,6 +323,15 @@ def _download_min_bytes_per_sec() -> int:
     return int(_env_int("TG_DOWNLOAD_MIN_BYTES_PER_SEC", 256 * 1024) or (256 * 1024))
 
 
+def _download_stall_seconds() -> float:
+    return float(_env_float("TG_DOWNLOAD_STALL_SECONDS", 180.0))
+
+
+def _download_total_timeout_seconds() -> float:
+    # 0 表示关闭“下载总时长硬超时”，仅依赖“无进度超时”来判断卡死。
+    return float(_env_float("TG_DOWNLOAD_TOTAL_TIMEOUT_SECONDS", 0.0))
+
+
 def _compute_download_timeout_seconds(expected_size: Optional[int]) -> float:
     hard = max(10.0, float(_download_timeout_seconds()))
     if expected_size is None or expected_size <= 0:
@@ -289,6 +340,44 @@ def _compute_download_timeout_seconds(expected_size: Optional[int]) -> float:
     min_bps = max(1, int(_download_min_bytes_per_sec()))
     adaptive = base + (float(expected_size) / float(min_bps))
     return max(hard, adaptive)
+
+
+async def _download_media_with_stall_guard(
+    client: TelegramClient,
+    message,
+    *,
+    file: str,
+    total_timeout_s: float,
+    stall_timeout_s: float,
+) -> None:
+    stall_timeout_s = max(10.0, float(stall_timeout_s))
+    last_progress_ts = time.monotonic()
+
+    def _progress_cb(current: int, total: Optional[int]) -> None:
+        nonlocal last_progress_ts
+        # 只要 Telethon 报告了任何进度，就认为连接是活的
+        last_progress_ts = time.monotonic()
+
+    async def _run() -> None:
+        await client.download_media(message, file=file, progress_callback=_progress_cb)
+
+    task = asyncio.create_task(_run())
+    start_ts = time.monotonic()
+    try:
+        while True:
+            if task.done():
+                return await task
+            now = time.monotonic()
+            if float(total_timeout_s) > 0 and (now - start_ts) > float(total_timeout_s):
+                task.cancel()
+                raise TimeoutError("下载总超时")
+            if (now - last_progress_ts) > float(stall_timeout_s):
+                task.cancel()
+                raise TimeoutError("下载无进度超时")
+            await asyncio.sleep(1.0)
+    finally:
+        if not task.done():
+            task.cancel()
 
 
 def _group_retry_attempts() -> int:
@@ -412,8 +501,10 @@ def _verify_group_files(prepared_group: PreparedDownloadGroup, source_id: int, m
 async def ensure_connected(client: TelegramClient, label: str) -> bool:
     try:
         if not client.is_connected():
+            logger.info("%s 准备重连…", label)
             await client.connect()
         if await client.is_user_authorized():
+            logger.info("%s 已恢复连接", label)
             return True
     except Exception as e:
         logger.warning("%s 重连失败：%s", label, str(e))
@@ -478,16 +569,28 @@ def ensure_empty_dir(path: Path) -> None:
             continue
 
 
-def extract_date_yyyy_mm_dd(text: str, fallback_dt: datetime) -> str:
+UNPARSED_DATE = "0000-00-00"
+
+
+def extract_date_yyyy_mm_dd(text: str) -> Optional[str]:
     match = DATE_RE.search(text or "")
     if match:
-        y, m, d = (int(match.group(1)), int(match.group(2)), int(match.group(3)))
-        return f"{y:04d}-{m:02d}-{d:02d}"
+        y = int(match.group("y1") or match.group("y2") or 0)
+        m = int(match.group("m1") or match.group("m2") or 0)
+        d = int(match.group("d1") or match.group("d2") or 0)
+        if y > 0 and 1 <= m <= 12 and 1 <= d <= 31:
+            return f"{y:04d}-{m:02d}-{d:02d}"
+    return None
 
-    local_dt = fallback_dt
-    if fallback_dt.tzinfo is not None:
-        local_dt = fallback_dt.astimezone()
-    return local_dt.date().isoformat()
+
+def _message_send_date_yyyy_mm_dd(message) -> Optional[str]:
+    try:
+        dt = getattr(message, "date", None)
+        if not dt:
+            return None
+        return str(dt.strftime("%Y-%m-%d"))
+    except Exception:
+        return None
 
 
 def build_group_uid(chat_id: int, topic_root_message_id: Optional[int], grouped_id: Optional[int], message_id: int) -> str:
@@ -611,6 +714,9 @@ class RcloneUploader:
                     self._db.mark_download_group_uploaded(
                         source_id, group_uid, uploaded=True, remote_dir=remote_dir, local_deleted=deleted
                     )
+
+                if self._cfg.rclone_cleanup_db_after_upload:
+                    self._db.delete_download_group(source_id, group_uid)
             except Exception as e:
                 logger.error(f"rclone 上传流程异常: {e}", exc_info=True)
                 self._db.mark_download_group_failed(source_id, group_uid, str(e))
@@ -618,10 +724,20 @@ class RcloneUploader:
                 self._queue.task_done()
 
     async def _rclone_copy(self, local_dir: Path, remote_dir: str) -> bool:
-        args = ["rclone", "copy", str(local_dir), str(remote_dir), "--create-empty-src-dirs"]
+        rclone_exe = resolve_rclone_executable()
+        # 防止把 remote_dir 当成“本地路径”误拷贝：rclone remote 必须是 `<name>:` 前缀
+        if not re.match(r"^[A-Za-z0-9_\\-]+:", str(remote_dir or "")):
+            logger.error("rclone 远端路径无效（缺少 remote 前缀 `<name>:`）：%s", str(remote_dir))
+            return False
+        args = [rclone_exe, "copy", str(local_dir), str(remote_dir), "--create-empty-src-dirs"]
         args.extend(self._cfg.rclone_extra_args)
 
-        logger.info(f"开始上传: {local_dir} -> {remote_dir}")
+        logger.info(f"开始上传：{local_dir} -> {remote_dir}")
+        if should_log_rclone_command():
+            logger.info("rclone 命令: %s", " ".join(args))
+        if rclone_exe != "rclone" and not Path(rclone_exe).exists():
+            logger.error("未找到 rclone 可执行文件：%s", rclone_exe)
+            return False
         proc = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.PIPE,
@@ -697,27 +813,31 @@ async def download_media_group(
 
         for group_attempt in range(1, group_attempts + 1):
             logger.info(
-                "开始下载媒体组: source=%s(%s) group_uid=%s msgs=%s ids=%s-%s dir=%s (%s/%s)",
-                str(source_row.get("id")),
+                "开始下载媒体组：%s ID:%s-%s 目录：%s（资源数量=%s 重试=%s/%s）",
                 source_title,
-                prepared_group.group_uid,
-                str(len(messages)),
                 str(min_id),
                 str(max_id),
                 str(prepared_group.local_dir),
+                str(len(messages)),
                 str(group_attempt),
                 str(group_attempts),
             )
 
-            # 目录清理策略：
-            # 1. 首次尝试时总是清空（避免旧文件残留）
-            # 2. 重试时如果上次有错误，也清空（避免部分下载残留污染重试）
+            # 目录清理策略（优化：不清空目录，保留已下载文件）：
+            # 1. 仅当数据库记录显示该组之前下载"失败"时才清空目录（首次重试失败记录）
+            # 2. 组级重试时**不清空目录**，完全依赖文件级检查和断点续传
+            # 3. 这样可以避免网络波动导致清空已下载的大文件
+            should_clear = False
             if group_attempt == 1:
-                # 重启/重试时如果目录已存在，Telethon 会自动重命名(1)(2)...；这里直接清空目录实现"覆盖替换"
-                ensure_empty_dir(prepared_group.local_dir)
-            elif last_group_err is not None:
-                # 重试时：如果上次有错误，清空目录避免残留文件污染
-                logger.info(f"组级重试，清空目录避免残留: {prepared_group.local_dir}")
+                # 检查数据库记录状态，仅失败组才清空
+                existing_record = db.get_download_group(int(source_row["id"]), prepared_group.group_uid)
+                if existing_record and existing_record.get("status") == "failed":
+                    logger.info(f"检测到失败记录，清空目录重新下载: {prepared_group.local_dir}")
+                    should_clear = True
+            # 删除了806-809行：组级重试时清空目录的逻辑
+            # 改为：重试时不清空，依赖文件级检查（跳过已完成文件，重新下载缺失/损坏文件）
+
+            if should_clear:
                 ensure_empty_dir(prepared_group.local_dir)
 
             sem = download_semaphore or asyncio.Semaphore(cfg.max_download_concurrency)
@@ -752,31 +872,49 @@ async def download_media_group(
                                             expected_size,
                                             label=f"source={source_row.get('id')} msg_id={msg_id_prefix}",
                                         )
+                                        if should_log_each_download_message():
+                                            logger.info(f"跳过已存在的文件: {final_path} (大小验证通过)")
                                         return  # 仅在验证通过后才跳过
                                     except ValueError:
                                         # 大小不对，文件已被删除，继续重新下载
                                         logger.info(f"文件大小验证失败，将重新下载: {final_path}")
                                         pass
                                 else:
+                                    if should_log_each_download_message():
+                                        logger.info(f"跳过已存在的文件: {final_path} (未启用大小验证)")
                                     return  # 不验证大小时，直接跳过
                         except Exception:
                             pass  # 其他异常（如文件损坏）也重新下载
 
+                    # 估算一个“足够长”的超时用于日志展示；实际是否启用总时长硬超时由 TG_DOWNLOAD_TOTAL_TIMEOUT_SECONDS 控制
                     timeout_s = float(_compute_download_timeout_seconds(expected_size))
+                    total_timeout_s = float(_download_total_timeout_seconds())
+                    if total_timeout_s > 0:
+                        total_timeout_s = max(10.0, min(float(total_timeout_s), float(timeout_s)))
                     attempts = max(1, int(_download_retry_attempts()))
                     last_err: Optional[Exception] = None
+                    download_msg = msg
                     for attempt in range(1, attempts + 1):
                         try:
                             global _ACTIVE_MEDIA_DOWNLOADS
                             if _atomic_replace_media() and msg_id > 0:
-                                tmp_name = f".tmp_{msg_id_prefix}_{secrets.token_hex(4)}{ext}"
-                                tmp_path = prepared_group.local_dir / tmp_name
+                                # 用固定临时文件名，避免重试/并发导致同一 msg_id 产生一堆 .tmp_* 残留文件
+                                tmp_path = prepared_group.local_dir / f".tmp_{msg_id_prefix}{ext}"
+                                try:
+                                    for p in prepared_group.local_dir.glob(f".tmp_{msg_id_prefix}_*{ext}"):
+                                        if p.is_file():
+                                            p.unlink(missing_ok=True)
+                                except Exception:
+                                    pass
                                 try:
                                     _ACTIVE_MEDIA_DOWNLOADS += 1
                                     try:
-                                        await asyncio.wait_for(
-                                            client.download_media(msg, file=str(tmp_path)),
-                                            timeout=timeout_s,
+                                        await _download_media_with_stall_guard(
+                                            client,
+                                            download_msg,
+                                            file=str(tmp_path),
+                                            total_timeout_s=total_timeout_s,
+                                            stall_timeout_s=_download_stall_seconds(),
                                         )
                                     finally:
                                         _ACTIVE_MEDIA_DOWNLOADS = max(0, int(_ACTIVE_MEDIA_DOWNLOADS) - 1)
@@ -810,7 +948,13 @@ async def download_media_group(
                                 target = prepared_group.local_dir / msg_id_prefix
                                 _ACTIVE_MEDIA_DOWNLOADS += 1
                                 try:
-                                    await asyncio.wait_for(client.download_media(msg, file=str(target)), timeout=timeout_s)
+                                    await _download_media_with_stall_guard(
+                                        client,
+                                        download_msg,
+                                        file=str(target),
+                                        total_timeout_s=total_timeout_s,
+                                        stall_timeout_s=_download_stall_seconds(),
+                                    )
                                 finally:
                                     _ACTIVE_MEDIA_DOWNLOADS = max(0, int(_ACTIVE_MEDIA_DOWNLOADS) - 1)
                                 if _verify_media_size() and final_path.exists():
@@ -821,10 +965,28 @@ async def download_media_group(
                                     )
                             last_err = None
                             break
+                        except errors.FileReferenceExpiredError as e:
+                            last_err = e
+                            logger.warning(
+                                "文件引用过期，将刷新消息后重试: source=%s group_uid=%s msg_id=%s (%s/%s)",
+                                str(source_row.get("id")),
+                                prepared_group.group_uid,
+                                str(msg_id),
+                                str(attempt),
+                                str(attempts),
+                            )
+                            try:
+                                refreshed = await client.get_messages(download_msg.peer_id, ids=download_msg.id)
+                                if refreshed:
+                                    download_msg = refreshed
+                                    continue
+                            except Exception as fetch_exc:
+                                last_err = fetch_exc
+                            break
                         except asyncio.TimeoutError as e:
                             last_err = e
                             logger.warning(
-                                "下载超时（%ss），将重试: source=%s group_uid=%s msg_id=%s expected=%s (%s/%s)",
+                                "下载超时（%ss），将重试: source=%s group_uid=%s msg_id=%s expected=%s (%s/%s) reason=%s",
                                 int(timeout_s),
                                 str(source_row.get("id")),
                                 prepared_group.group_uid,
@@ -832,6 +994,7 @@ async def download_media_group(
                                 str(expected_size or 0),
                                 str(attempt),
                                 str(attempts),
+                                str(e) or e.__class__.__name__,
                             )
                         except ConnectionError as e:
                             last_err = e
@@ -884,14 +1047,20 @@ async def download_media_group(
             # 记录本次错误，下次重试时会清空目录
             last_group_err = first_err
             err_text = str(first_err) or repr(first_err) or first_err.__class__.__name__
-            logger.warning("媒体组下载异常，将断开并重连后重试：%s", err_text)
+            logger.warning(
+                "媒体组下载异常，将断开并重连后重试：%s（重试=%s/%s）",
+                err_text,
+                str(group_attempt),
+                str(group_attempts),
+            )
             try:
                 await client.disconnect()
             except Exception:
                 pass
             if group_delay > 0:
                 await asyncio.sleep(group_delay)
-            await ensure_connected(client, "Downloader")
+            if not await ensure_connected(client, "Downloader"):
+                logger.warning("Downloader 重连未成功，将继续下一次重试")
 
         db.add_download_group(
             source_id=source_row["id"],
@@ -905,8 +1074,17 @@ async def download_media_group(
         )
 
         db.update_download_source_last_message(source_row["id"], prepared_group.last_message_id)
+        # 用本组的消息范围展示，更符合“下载了哪些”的直觉
+        msg_ids = [int(getattr(m, "id", 0) or 0) for m in messages]
+        msg_ids = [mid for mid in msg_ids if mid > 0]
+        min_id = min(msg_ids) if msg_ids else 0
+        max_id = max(msg_ids) if msg_ids else 0
         logger.info(
-            f"下载完成: source={source_row['id']} date={prepared_group.date_str} id={prepared_group.seq} last={prepared_group.last_message_id}"
+            "下载完成：资源数量=%s date=%s ID=%s-%s",
+            str(len(messages)),
+            str(prepared_group.date_str),
+            str(min_id),
+            str(max_id),
         )
 
         if cfg.rclone_enabled and prepared_group.remote_dir:
@@ -973,30 +1151,33 @@ def _prepare_download_group(
     group_uid = build_group_uid(chat_id, topic_root_message_id, grouped_id, messages[0].id)
     existing = db.get_download_group(int(source_row["id"]), str(group_uid))
     if existing:
-        # 已成功的组直接跳过；失败的组允许重试，但复用原有 seq/目录，避免编号跳号
-        if str(existing.get("status")) != "failed":
-            if should_log_each_download_message():
-                logger.info(
-                    f"跳过已下载的媒体组: source={source_row['id']} group_uid={group_uid} status={existing.get('status')} ids={[m.id for m in messages]}"
-                )
-            return None
-
+        # 不再根据数据库状态跳过，完全依赖文件级别检查
+        # 但复用已有的 seq/目录/日期，避免编号跳号和目录重复
         date_str = str(existing.get("date") or "")
         seq = int(existing.get("seq") or 0)
         local_dir_raw = existing.get("local_dir")
         local_dir = Path(str(local_dir_raw)) if local_dir_raw else None
 
         text_for_date = header_text or _pick_text_for_date(messages)
-        # 失败重试时：如果能从文本中提取到日期且与旧日期不同，则以新日期为准（旧数据可能是 fallback 到消息时间导致）
-        if DATE_RE.search(text_for_date or ""):
-            extracted_date = extract_date_yyyy_mm_dd(text_for_date, messages[0].date)
-            if extracted_date and extracted_date != date_str:
-                date_str = extracted_date
-                seq = 0
-                local_dir = None
+        extracted_date = extract_date_yyyy_mm_dd(text_for_date)
+        if extracted_date and extracted_date != date_str:
+            date_str = extracted_date
+            seq = 0
+            local_dir = None
 
         if not date_str:
-            date_str = extract_date_yyyy_mm_dd(text_for_date, messages[0].date)
+            fallback_date = _message_send_date_yyyy_mm_dd(messages[0])
+            if fallback_date:
+                date_str = fallback_date
+            else:
+                logger.warning(
+                    "未从标题/文本提取到日期，将使用占位日期=%s（source_id=%s group_uid=%s msg_id=%s）",
+                    UNPARSED_DATE,
+                    str(source_row.get("id")),
+                    str(group_uid),
+                    str(getattr(messages[0], "id", "")),
+                )
+                date_str = UNPARSED_DATE
 
         if seq <= 0 or local_dir is None:
             seq = folder_id
@@ -1008,6 +1189,9 @@ def _prepare_download_group(
             local_dir = cfg.download_root_dir / source_title / date_str / group_folder
 
         remote_dir = existing.get("remote_dir")
+        # 兼容旧数据：remote_dir 若缺少 `<name>:` 前缀则视为无效，重新按当前配置生成
+        if cfg.rclone_enabled and remote_dir and (not is_valid_rclone_remote_path(str(remote_dir))):
+            remote_dir = None
         if cfg.rclone_enabled and not remote_dir:
             remote_base = cfg.rclone_remote_base_dir.strip("/\\") if cfg.rclone_remote_base_dir else ""
             remote_rel = "/".join(part for part in [remote_base, source_title, date_str, group_folder] if part)
@@ -1041,7 +1225,22 @@ def _prepare_download_group(
         )
 
     text_for_date = header_text or _pick_text_for_date(messages)
-    date_str = extract_date_yyyy_mm_dd(text_for_date, messages[0].date)
+    extracted_date = extract_date_yyyy_mm_dd(text_for_date)
+    if not extracted_date:
+        fallback_date = _message_send_date_yyyy_mm_dd(messages[0])
+        if fallback_date:
+            date_str = fallback_date
+        else:
+            logger.warning(
+                "未从标题/文本提取到日期，将使用占位日期=%s（source_id=%s group_uid=%s msg_id=%s）",
+                UNPARSED_DATE,
+                str(source_row.get("id")),
+                str(group_uid),
+                str(getattr(messages[0], "id", "")),
+            )
+            date_str = UNPARSED_DATE
+    else:
+        date_str = extracted_date
 
     seq = folder_id
     group_folder = preferred_folder
@@ -1051,6 +1250,7 @@ def _prepare_download_group(
 
     remote_dir = None
     if cfg.rclone_enabled:
+        # cfg.rclone_remote 在 load_config 中已规范化为 `<name>:`
         remote_base = cfg.rclone_remote_base_dir.strip("/\\") if cfg.rclone_remote_base_dir else ""
         remote_rel = "/".join(part for part in [remote_base, source_title, date_str, group_folder] if part)
         remote_dir = f"{cfg.rclone_remote}{remote_rel}"
@@ -1300,6 +1500,15 @@ class DownloaderRuntime:
         self._clone_tasks[source_id] = task
         return task
 
+    def stop_clone(self, source_id: int) -> bool:
+        source_id = int(source_id)
+        task = self._clone_tasks.get(source_id)
+        if not task or task.done():
+            return False
+        task.cancel()
+        self._update_clone_progress(source_id, status="cancelled", finished_at=float(time.time()))
+        return True
+
     async def clone_source(
         self,
         source_id: int,
@@ -1311,6 +1520,9 @@ class DownloaderRuntime:
         if not source:
             raise RuntimeError("来源不存在")
 
+        # 清理旧的失败记录，避免重启后显示旧的失败数据
+        self._db.clear_failed_download_groups(source_id)
+
         if start_from_message_id is not None:
             start_from = int(start_from_message_id)
             if start_from > 0:
@@ -1319,16 +1531,22 @@ class DownloaderRuntime:
                 self._db.set_download_source_last_message(source_id, max(0, start_from - 1))
                 source = self._db.get_download_source(source_id) or source
 
+        # 计算初始消息 ID，确保至少为 1，避免显示"计算中"
+        if start_from_message_id is not None:
+            init_msg_id = max(1, int(start_from_message_id or 1))
+        else:
+            init_msg_id = max(1, int(source.get("last_message_id") or 0) + 1)
+
         self._update_clone_progress(
             source_id,
             status="starting",
             started_at=float(time.time()),
             groups_done=0,
-            current_message_id=max(0, int(start_from_message_id or 0) - 1)
-            if start_from_message_id is not None
-            else int(source.get("last_message_id") or 0),
+            messages_scanned=0,  # 已遍历的消息数
+            total_messages=0,    # 预估的总消息数
+            current_message_id=init_msg_id,
             latest_message_id=0,
-            start_from_message_id=int(start_from_message_id or 0),
+            start_from_message_id=int(start_from_message_id or init_msg_id),
         )
 
         # 克隆期间暂停监听，避免并发重复下载；仅在成功后再开启监听
@@ -1342,7 +1560,7 @@ class DownloaderRuntime:
                 if not await ensure_connected(self._client, "Clone"):
                     raise ConnectionError("Telegram 未连接或未授权")
 
-                # 预估最新消息ID（用于进度展示）
+                # 预估最新消息ID和总消息数（用于进度展示）
                 try:
                     entity = await self._client.get_entity(int(source["chat_id"]))
                     reply_to = None
@@ -1353,20 +1571,45 @@ class DownloaderRuntime:
                     async for m in self._client.iter_messages(entity, limit=1, reply_to=reply_to):
                         latest_id = int(getattr(m, "id", 0) or 0)
                         break
-                    self._update_clone_progress(source_id, latest_message_id=latest_id)
+
+                    # 计算预估总消息数（最新ID - 起始ID，这只是粗略估计）
+                    estimated_total = max(0, latest_id - init_msg_id + 1) if latest_id > 0 else 0
+
+                    self._update_clone_progress(
+                        source_id,
+                        latest_message_id=latest_id,
+                        total_messages=estimated_total
+                    )
                 except Exception as e:
                     self._update_clone_progress(source_id, latest_message_id=0, latest_error=str(e))
 
                 groups_done = 0
+                messages_scanned = 0  # 已遍历的消息数
 
-                def on_group_done(group_last_message_id: int) -> None:
-                    nonlocal groups_done
-                    groups_done += 1
+                def on_message_progress(scanned_count: int = 0, is_group_done: bool = False, current_msg_id: int = 0) -> None:
+                    """更新克隆进度
+                    Args:
+                        scanned_count: 已遍历的消息数（累计）
+                        is_group_done: 是否是媒体组完成的回调（True=媒体组完成，False=仅消息遍历）
+                        current_msg_id: 当前消息ID（用于日志）
+                    """
+                    nonlocal groups_done, messages_scanned
+                    # 更新已遍历消息数
+                    if scanned_count > 0:
+                        messages_scanned = scanned_count
+
+                    # 只在媒体组完成时增加计数
+                    if is_group_done:
+                        groups_done += 1
+                        logger.info(f"媒体组完成: 消息ID={current_msg_id} 已完成组数={groups_done}")
+
+                    prev = self._clone_progress.get(int(source_id)) or {}
                     self._update_clone_progress(
                         source_id,
                         status="running",
                         groups_done=groups_done,
-                        current_message_id=int(group_last_message_id or 0),
+                        messages_scanned=messages_scanned,
+                        current_message_id=int(current_msg_id) if int(current_msg_id or 0) > 0 else int(prev.get("current_message_id") or 0),
                     )
 
                 await backfill_single_source(
@@ -1378,9 +1621,9 @@ class DownloaderRuntime:
                     download_semaphore=self._download_semaphore,
                     group_semaphore=self._group_semaphore,
                     start_from_message_id=start_from_message_id,
-                    progress_hook=on_group_done,
+                    progress_hook=on_message_progress,
                 )
-                # 再跑一次兜底 catch-up，降低“克隆过程中新增消息漏掉”的概率
+                # 再跑一次兜底 catch-up，降低"克隆过程中新增消息漏掉"的概率
                 source2 = self._db.get_download_source(source_id) or source
                 await backfill_single_source(
                     self._client,
@@ -1391,13 +1634,16 @@ class DownloaderRuntime:
                     download_semaphore=self._download_semaphore,
                     group_semaphore=self._group_semaphore,
                     start_from_message_id=None,
-                    progress_hook=on_group_done,
+                    progress_hook=on_message_progress,
                 )
 
                 self._update_clone_progress(source_id, status="done", finished_at=float(time.time()))
                 ok = True
                 last_err = None
                 break
+            except asyncio.CancelledError:
+                self._update_clone_progress(source_id, status="cancelled", finished_at=float(time.time()))
+                raise
             except ConnectionError as e:
                 last_err = e
                 self._update_clone_progress(source_id, status="retrying", last_error=str(e))
@@ -1575,12 +1821,14 @@ async def backfill_single_source(
 
         if progress_hook:
             try:
-                progress_hook(last_id)
+                progress_hook(scanned_count=0, is_group_done=True, current_msg_id=last_id)
             except Exception:
                 pass
 
         # 这里按“消息遍历顺序”预分配日期/编号，避免并发导致 TG@BieLaoZai_002/009 这种乱序编号
-        prepared = _prepare_download_group(cfg, db, source, messages_snapshot, header_text=header_snapshot)
+        # 运行中可能发生“重命名来源”等变更；这里每次落盘前以数据库最新值为准（主要是 display_title 影响目录名）。
+        source_latest = db.get_download_source(int(source.get("id") or 0)) or source
+        prepared = _prepare_download_group(cfg, db, source_latest, messages_snapshot, header_text=header_snapshot)
         if not prepared:
             return
 
@@ -1589,7 +1837,7 @@ async def backfill_single_source(
                 client,
                 cfg,
                 db,
-                source,
+                source_latest,
                 messages_snapshot,
                 uploader,
                 download_semaphore=download_semaphore,
@@ -1610,7 +1858,7 @@ async def backfill_single_source(
         # 标题/说明文本：用于后续媒体组抽取日期
         if (not has_media) and msg_text:
             last_header_text = msg_text
-            # 有些话题是“先发媒体组，后补一条文字标题/日期”，这里把后补标题绑定给当前 pending 组
+            # 有些话题是"先发媒体组，后补一条文字标题/日期"，这里把后补标题绑定给当前 pending 组
             if pending_group_key is not None and pending_messages:
                 if (not pending_header_text) or (DATE_RE.search(pending_header_text or "") is None):
                     if DATE_RE.search(msg_text):
@@ -1634,6 +1882,8 @@ async def backfill_single_source(
 
     used_fallback = False
     message_count = 0  # 统计遍历到的消息数
+    last_progress_update = 0  # 上次进度更新的消息计数
+    last_scanned_msg_id = 0
     try:
         logger.info(
             f"开始遍历消息: source={source['id']} min_id={last_message_id} reply_to={reply_to} source_type={source.get('source_type')}"
@@ -1645,19 +1895,58 @@ async def backfill_single_source(
             reply_to=reply_to,
         ):
             message_count += 1
+            last_scanned_msg_id = int(getattr(msg, "id", 0) or 0)
             if message_count <= 5 or message_count % 10 == 0:
                 logger.info(f"遍历消息: id={msg.id} has_media={bool(getattr(msg, 'media', None))}")
+
+            # 前几条消息更频繁更新，避免 UI 长时间停在“初始化中…”
+            if progress_hook and (message_count <= 5 or (message_count - last_progress_update) >= 10):
+                try:
+                    logger.debug(f"更新遍历进度: 消息ID={msg.id} 已遍历={message_count}条")
+                    progress_hook(scanned_count=message_count, is_group_done=False, current_msg_id=int(msg.id))
+                    last_progress_update = message_count
+                except Exception as e:
+                    logger.warning(f"更新进度失败: {e}")
+                    pass
+
             await _handle_message(msg)
+
+        # 遍历完成后，确保更新最终进度
+        if progress_hook and message_count > 0:
+            try:
+                progress_hook(scanned_count=message_count, is_group_done=False, current_msg_id=last_scanned_msg_id)
+            except Exception:
+                pass
+
         logger.info(f"消息遍历完成: source={source['id']} 共遍历 {message_count} 条消息")
     except Exception as e:
-        # forum 话题在某些场景下 reply_to 会触发 GetRepliesRequest，可能报 TOPIC_ID_INVALID。
+        # forum 话题在某些场景下 reply_to 会触发 GetRepliesRequest：
+        # - TOPIC_ID_INVALID：话题 ID 不合法或无法访问
+        # - FrozenMethodInvalidError：账号被冻结/受限，禁止使用 GetRepliesRequest
         # 兜底：改为遍历全群消息，并用 reply_to_top_id/top_msg_id 过滤话题消息（更慢但更稳）。
-        if reply_to and source.get("source_type") == "forum_topic" and "TOPIC_ID_INVALID" in str(e):
-            used_fallback = True
-            logger.warning(
-                f"forum_topic reply_to 无效，降级为全群遍历过滤: source={source.get('id')} chat_id={chat_id} topic_root={reply_to} err={e}"
-            )
-            await _flush_pending()
+        if reply_to and source.get("source_type") == "forum_topic":
+            if isinstance(e, errors.FrozenMethodInvalidError) or "frozen accounts" in str(e).lower():
+                used_fallback = True
+                logger.warning(
+                    "账号受限，reply_to 遍历不可用，降级为全群遍历过滤: source=%s chat_id=%s topic_root=%s err=%s",
+                    str(source.get("id")),
+                    str(chat_id),
+                    str(reply_to),
+                    str(e),
+                )
+                await _flush_pending()
+            elif "TOPIC_ID_INVALID" in str(e):
+                used_fallback = True
+                logger.warning(
+                    "forum_topic reply_to 无效，降级为全群遍历过滤: source=%s chat_id=%s topic_root=%s err=%s",
+                    str(source.get("id")),
+                    str(chat_id),
+                    str(reply_to),
+                    str(e),
+                )
+                await _flush_pending()
+            else:
+                raise
         else:
             raise
 
@@ -1699,6 +1988,9 @@ def main() -> None:
 
     try:
         asyncio.run(run_downloader(backfill=bool(args.backfill)))
+    except RuntimeError as e:
+        print(f"❌ {e}")
+        sys.exit(1)
     except KeyboardInterrupt:
         sys.exit(0)
 

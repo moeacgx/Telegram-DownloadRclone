@@ -13,6 +13,52 @@
 - Python 3.8+
 - `pip install -r requirements.txt`
 - （可选）安装 `rclone` 并配置好 remote
+- （可选）如启用代理（`PROXY_ENABLED=true`），需要 `PySocks`（已包含在 `requirements.txt`）
+
+## Docker（上云部署）
+
+1) 准备 `.env`（参考 `.env.example`），并确保 `sessions/` 会持久化（挂载卷）。
+
+2) 首次生成用户会话（需要交互输入验证码/2FA）：
+
+```bash
+docker compose --profile tools run --rm tg-login
+```
+
+会生成 `sessions/user_session.session`。
+
+3) 启动管理 Bot（会同时跑下载监听/克隆）：
+
+```bash
+docker compose up -d tg-manager
+```
+
+### rclone 配置（容器内上传）
+
+本项目使用 `RCLONE_REMOTE`（例如 `pikpak:`）指向 rclone 的 remote 配置。Docker 场景下需要把 rclone 配置文件持久化到宿主机目录 `./rclone/`，并挂载到容器的 `/root/.config/rclone/`。
+
+初始化/编辑 rclone remote（交互式）：
+
+```bash
+docker compose --profile tools run --rm tg-rclone config
+```
+
+验证 remote 是否可用（示例把 `pikpak:` 替换成你的 remote 名称）：
+
+```bash
+docker compose --profile tools run --rm tg-rclone lsd pikpak:
+```
+
+然后在 `.env` 中开启：
+- `RCLONE_ENABLED=true`
+- `RCLONE_REMOTE=pikpak:`
+- （可选）`RCLONE_REMOTE_BASE_DIR=TGDownloads`
+
+日志查看：
+
+```bash
+docker compose logs -f tg-manager
+```
 
 ## 配置
 
@@ -118,6 +164,8 @@ python bot.py --backfill
 - `RCLONE_ENABLED=true`
 - `RCLONE_REMOTE=pikpak:`
 - `RCLONE_REMOTE_BASE_DIR=TGDownloads`（可选）
+
+注意：开启 `rclone` 上传会占用网络带宽，可能显著影响 Telegram 下载速度；可用 `RCLONE_EXTRA_ARGS` 配置限速（例如 `--bwlimit 8M`）。
 - `RCLONE_DELETE_LOCAL_AFTER_UPLOAD=true`
 
 下载完成后会执行：

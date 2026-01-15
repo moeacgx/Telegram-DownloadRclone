@@ -36,34 +36,7 @@ from telethon import TelegramClient, events, functions, Button
 from telethon.errors.rpcerrorlist import MessageNotModifiedError, ReplyMarkupInvalidError
 
 from database import Database
-from bot import DownloaderRuntime, load_config as load_downloader_config, setup_logging
-
-
-async def _connection_watchdog(client: TelegramClient, name: str) -> None:
-    if not _env_bool("TG_PING_ENABLED", True):
-        return
-
-    interval = float(_env_float("TG_PING_INTERVAL_SECONDS", 20.0))
-    timeout = float(_env_float("TG_PING_TIMEOUT_SECONDS", 10.0))
-    interval = max(5.0, float(interval))
-    timeout = max(3.0, float(timeout))
-
-    while True:
-        await asyncio.sleep(interval)
-        try:
-            await asyncio.wait_for(client(functions.updates.GetStateRequest()), timeout=timeout)
-        except asyncio.CancelledError:
-            return
-        except Exception as e:
-            # 切换代理节点时，现有连接可能“卡住但不退出”；这里主动断开让外层监督逻辑重连。
-            import logging
-
-            logging.getLogger(__name__).warning("%s 连接疑似卡死/超时，将触发重连：%s", name, str(e))
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-            return
+from bot import DownloaderRuntime, load_config as load_downloader_config, sanitize_path_component, setup_logging
 
 
 def _env_int(name: str, default: Optional[int] = None) -> Optional[int]:
@@ -116,8 +89,10 @@ def build_proxy() -> Optional[Tuple[int, str, int, bool, Optional[str], Optional
         return None
 
     if socks is None:
-        print("代理已启用但未安装 PySocks（pysocks）")
-        return None
+        raise RuntimeError(
+            "代理已启用但未安装 PySocks（pysocks）。请运行：python -m pip install -r requirements.txt；"
+            "或将 PROXY_ENABLED=false 关闭代理。"
+        )
 
     proxy_type_raw = (_env_str("PROXY_TYPE", "socks5") or "socks5").lower()
     if proxy_type_raw == "socks5":
@@ -328,48 +303,42 @@ def generate_source_list_message(
         source_id = int(source["id"])
         title = str(source.get("display_title") or f"source_{source_id}")
         status_icon = "✅" if source.get("is_active") else "⏸️"
-        clone_text = "📦 可克隆"
+
+        # 简洁显示模式，不显示详细克隆进度
         if runtime.is_cloning(source_id):
-            prog = None
-            try:
-                prog = runtime.get_clone_progress(source_id)
-            except Exception:
-                prog = None
-            if prog:
-                cur = int(prog.get("current_message_id") or source.get("last_message_id") or 0)
-                latest = int(prog.get("latest_message_id") or 0)
-                groups_done = int(prog.get("groups_done") or 0)
-                if latest > 0 and cur > 0:
-                    clone_text = f"📦 克隆中: {cur}/{latest}（组 {groups_done}）"
-                elif cur > 0:
-                    clone_text = f"📦 克隆中: 到 {cur}（组 {groups_done}）"
-                else:
-                    clone_text = "📦 克隆中"
-            else:
-                clone_text = "📦 克隆中"
+            mode_text = "📡 模式: 克隆中"
+        elif source.get("is_active"):
+            mode_text = "📡 模式: 实时监听"
+        else:
+            mode_text = "📡 模式: 已暂停"
+
         counts = db.count_download_groups_by_status(source_id)
         failed = int(counts.get("failed", 0))
         total = int(counts.get("total", 0))
+        last_msg_id = int(source.get('last_message_id') or 0)
 
         text_lines.append(
             f"{status_icon} {title}\n"
-            f"   📊 已下载组: {total}（失败 {failed}）\n"
-            f"   🔖 最后消息ID: {int(source.get('last_message_id') or 0)}\n"
-            f"   {clone_text}\n"
+            f"   {mode_text}\n"
+            f"   📊 最后同步: 消息 {last_msg_id}\n"
         )
 
         toggle_label = "⏸️ 暂停监听" if source.get("is_active") else "▶️ 开始监听"
         buttons.append(
             [Button.inline(f"{status_icon} {_truncate_button_text(title, 40)}", f"src:noop:{source_id}".encode("utf-8"))]
         )
-        buttons.append(
-            [
-                Button.inline(toggle_label, f"src:toggle:{source_id}".encode("utf-8")),
-                Button.inline("📦 克隆", f"src:clone:{source_id}".encode("utf-8")),
-                Button.inline("🔁 补克隆(URL)", f"src:patch:{source_id}".encode("utf-8")),
-                Button.inline("🗑️ 删除", f"src:del:{source_id}".encode("utf-8")),
-            ]
-        )
+        action_row: List[Button] = [Button.inline(toggle_label, f"src:toggle:{source_id}".encode("utf-8"))]
+        if runtime.is_cloning(source_id):
+            action_row.append(Button.inline("⏹ 停止克隆", f"src:clonestop:{source_id}".encode("utf-8")))
+        else:
+            action_row.append(Button.inline("📦 克隆", f"src:clone:{source_id}".encode("utf-8")))
+
+        action_row.append(Button.inline("✏️ 重命名", f"src:rename:{source_id}".encode("utf-8")))
+        action_row.append(Button.inline("⬆ 一键上传", f"src:uploadsrc:{source_id}".encode("utf-8")))
+        action_row.append(Button.inline("🗑️ 删除", f"src:del:{source_id}".encode("utf-8")))
+        buttons.append(action_row[:4])
+        if len(action_row) > 4:
+            buttons.append(action_row[4:])
 
     nav: List[Button] = []
     if page > 0:
@@ -557,6 +526,13 @@ def _help_text() -> str:
     )
 
 
+def _normalize_rclone_remote(remote: str) -> str:
+    remote = (remote or "").strip()
+    if not remote:
+        return ""
+    return remote if remote.endswith(":") else f"{remote}:"
+
+
 async def main_async() -> None:
     load_dotenv()
     setup_logging(_env_bool("DEBUG", False))
@@ -605,6 +581,8 @@ async def main_async() -> None:
     runtime = DownloaderRuntime(user_client, downloader_cfg, db)
     runtime.start()
 
+    upload_tasks: Dict[int, asyncio.Task] = {}
+
     pending: Dict[int, PendingState] = {}
     topic_page_size = int(_env_int("BOT_TOPIC_PAGE_SIZE", 10) or 10)
     topic_page_size = max(5, min(20, topic_page_size))
@@ -623,35 +601,40 @@ async def main_async() -> None:
             prog = None
 
         if not prog:
-            return f"📦 正在克隆：{title}\n状态：初始化中…"
+            return f"📦 正在克隆频道: {title}\n状态：初始化中…"
 
         status = str(prog.get("status") or "running")
         groups_done = int(prog.get("groups_done") or 0)
-        cur = int(prog.get("current_message_id") or 0)
-        latest = int(prog.get("latest_message_id") or 0)
-        start_from = int(prog.get("start_from_message_id") or 0)
-        last_error = str(prog.get("last_error") or prog.get("latest_error") or "").strip()
+        messages_scanned = int(prog.get("messages_scanned") or 0)
+        total_messages = int(prog.get("total_messages") or 0)
+        current_msg_id = int(prog.get("current_message_id") or 0)
 
-        if latest > 0 and cur > 0:
-            progress_line = f"进度：{cur}/{latest}"
-        elif cur > 0:
-            progress_line = f"进度：到消息 {cur}"
+        # 简洁格式：统计数量而不是显示ID
+        lines = [f"📦 正在克隆频道: {title}"]
+
+        # 当前进度（已上传完成的最后一个消息ID）
+        if current_msg_id > 0:
+            lines.append(f"📍 当前进度: 消息 {current_msg_id}")
+
+        # 进度：显示已遍历消息数 / 预估总数
+        if total_messages > 0 and messages_scanned > 0:
+            progress_pct = int(messages_scanned * 100 / total_messages) if total_messages > 0 else 0
+            lines.append(f"📊 进度: 已遍历 {messages_scanned}/{total_messages} 条消息 ({progress_pct}%)")
+        elif messages_scanned > 0:
+            lines.append(f"📊 进度: 已遍历 {messages_scanned} 条消息")
         else:
-            progress_line = "进度：计算中…"
+            lines.append(f"📊 进度: 初始化中…")
 
-        start_line = f"起始：{start_from}" if start_from > 0 else "起始：自动（last_message_id）"
-        updated_at = time.strftime("%H:%M:%S", time.localtime())
+        # 已完成媒体组数
+        if groups_done > 0:
+            lines.append(f"✅ 已完成媒体组: {groups_done}")
 
-        text = (
-            f"📦 正在克隆：{title}\n"
-            f"状态：{status}\n"
-            f"{progress_line}（已完成媒体组：{groups_done}）\n"
-            f"{start_line}\n"
-            f"更新时间：{updated_at}"
-        )
+        # 错误信息（如果有）
+        last_error = str(prog.get("last_error") or prog.get("latest_error") or "").strip()
         if last_error:
-            text += f"\n\n最近错误：{last_error}"
-        return text
+            lines.append(f"\n⚠️ 最近错误: {last_error}")
+
+        return "\n".join(lines)
 
     def _build_status_text() -> str:
         sources_all = db.list_download_sources(active_only=False)
@@ -1058,6 +1041,7 @@ async def main_async() -> None:
                             Button.inline("🔢 指定ID/链接", f"src:cloneask:{source_id}".encode("utf-8")),
                         ],
                         [Button.inline("🧹 从头克隆", f"src:clonefrom0:{source_id}".encode("utf-8"))],
+                        [Button.inline("🔁 补克隆(URL)", f"src:patch:{source_id}".encode("utf-8"))],
                         [Button.inline("关闭", b"src:close")],
                     ],
                 )
@@ -1075,6 +1059,19 @@ async def main_async() -> None:
                     "https://t.me/c/3406401277/6779/7304\n"
                     "https://t.me/c/3406401277/6779/7310\n"
                     "或：7304\n",
+                    buttons=_reply_menu_keyboard(),
+                )
+                return
+
+            if action == "rename":
+                pending[user_id] = PendingTextInput(kind="renamesource", payload={"source_id": source_id})
+                old = str(source.get("display_title") or f"source_{source_id}")
+                await event.answer("请发送新名称")
+                await bot_client.send_message(
+                    int(event.chat_id),
+                    f"✏️ 重命名来源：{old}\n"
+                    "请发送新的显示名称（将用于本地/云盘文件夹名）。\n"
+                    "提示：只影响后续新下载；已存在的历史文件夹不会自动改名。",
                     buttons=_reply_menu_keyboard(),
                 )
                 return
@@ -1097,6 +1094,109 @@ async def main_async() -> None:
                         list_message_id=int(getattr(event, "message_id", 0) or 0) or None,
                     )
                 )
+                await _refresh()
+                return
+
+            if action == "clonestop":
+                if not runtime.is_cloning(source_id):
+                    await event.answer("当前未在克隆")
+                    return
+                ok = runtime.stop_clone(source_id)
+                db.set_download_source_active(source_id, True)
+                runtime.refresh_sources_cache(force=True)
+                await event.answer("已停止" if ok else "停止失败")
+                await _refresh()
+                return
+
+            if action == "uploadsrc":
+                if source_id in upload_tasks and not upload_tasks[source_id].done():
+                    await event.answer("该来源正在上传中")
+                    return
+
+                rclone_remote = _normalize_rclone_remote(os.environ.get("RCLONE_REMOTE") or "")
+                if not rclone_remote:
+                    await event.answer("请先在 .env 配置 RCLONE_REMOTE", alert=True)
+                    return
+
+                source_title = sanitize_path_component(str(source.get("display_title") or f"source_{source_id}"))
+                local_dir = downloader_cfg.download_root_dir / source_title
+                if not local_dir.exists():
+                    await event.answer("本地目录不存在", alert=True)
+                    return
+
+                remote_base = (os.environ.get("RCLONE_REMOTE_BASE_DIR") or "").strip("/\\")
+                remote_rel = "/".join(part for part in [remote_base, source_title] if part)
+                remote_dir = f"{rclone_remote}{remote_rel}"
+                if not re.match(r"^[A-Za-z0-9_\\-]+:", str(remote_dir or "")):
+                    await event.answer("远端路径无效（缺少 remote 前缀 `<name>:`）", alert=True)
+                    return
+
+                rclone_exe = "rclone"
+                if Path("./rclone.exe").exists():
+                    rclone_exe = str(Path("./rclone.exe"))
+                elif Path("./rclone").exists():
+                    rclone_exe = str(Path("./rclone"))
+
+                extra_args_raw = os.environ.get("RCLONE_EXTRA_ARGS") or ""
+                extra_args = [a for a in extra_args_raw.split() if a.strip()]
+
+                title = str(source.get("display_title") or f"source_{source_id}")
+                await event.answer("开始上传…")
+                msg = await bot_client.send_message(
+                    int(event.chat_id),
+                    f"⬆ 正在上传来源目录：{title}\n本地：{local_dir}\n远端：{remote_dir}",
+                    buttons=_reply_menu_keyboard(),
+                )
+
+                async def _run_upload() -> None:
+                    try:
+                        args = [rclone_exe, "copy", str(local_dir), str(remote_dir), "--create-empty-src-dirs"]
+                        args.extend(extra_args)
+                        try:
+                            await bot_client.edit_message(
+                                int(event.chat_id),
+                                int(msg.id),
+                                f"⬆ 正在上传来源目录：{title}\n本地：{local_dir}\n远端：{remote_dir}\n命令：{' '.join(args)}",
+                                buttons=_reply_menu_keyboard(),
+                            )
+                        except Exception:
+                            pass
+                        proc = await asyncio.create_subprocess_exec(
+                            *args,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.STDOUT,
+                        )
+                        assert proc.stdout is not None
+                        async for line in proc.stdout:
+                            text = line.decode(errors="ignore").rstrip()
+                            logger.info(text)
+                        code = await proc.wait()
+                        if code == 0:
+                            await bot_client.edit_message(
+                                int(event.chat_id),
+                                int(msg.id),
+                                f"✅ 上传完成：{title}\n远端：{remote_dir}",
+                                buttons=_reply_menu_keyboard(),
+                            )
+                        else:
+                            await bot_client.edit_message(
+                                int(event.chat_id),
+                                int(msg.id),
+                                f"❌ 上传失败(code={code})：{title}\n远端：{remote_dir}",
+                                buttons=_reply_menu_keyboard(),
+                            )
+                    except Exception as e:
+                        try:
+                            await bot_client.edit_message(
+                                int(event.chat_id),
+                                int(msg.id),
+                                f"❌ 上传异常：{title}\n原因：{e}",
+                                buttons=_reply_menu_keyboard(),
+                            )
+                        except Exception:
+                            pass
+
+                upload_tasks[source_id] = asyncio.create_task(_run_upload())
                 await _refresh()
                 return
 
@@ -1450,6 +1550,34 @@ async def main_async() -> None:
                     )
                     return
 
+                if state.kind == "renamesource":
+                    src_id = int((state.payload or {}).get("source_id") or 0)
+                    source = db.get_download_source(src_id)
+                    if not source:
+                        pending.pop(user_id, None)
+                        await event.reply("来源不存在", buttons=_reply_menu_keyboard())
+                        return
+
+                    new_title = (text or "").strip()
+                    if not new_title:
+                        raise ValueError("名称不能为空")
+                    if len(new_title) > 80:
+                        raise ValueError("名称过长（最多 80 字符）")
+
+                    ok = db.set_download_source_display_title(src_id, new_title)
+                    runtime.refresh_sources_cache(force=True)
+                    pending.pop(user_id, None)
+                    await event.reply(
+                        f"已重命名：{source.get('display_title') or f'source_{src_id}'} -> {new_title}\n"
+                        "后续下载/上传会使用新名称作为博主文件夹名。",
+                        buttons=_reply_menu_keyboard(),
+                    )
+                    try:
+                        await send_source_list(event)
+                    except Exception:
+                        pass
+                    return
+
                 if state.kind == "patchclone":
                     src_id = int((state.payload or {}).get("source_id") or 0)
                     source = db.get_download_source(src_id)
@@ -1572,54 +1700,8 @@ async def main_async() -> None:
 
     logger = logging.getLogger(__name__)
     logger.info("管理 Bot 已启动")
-    reconnect_delay = 2.0
-    reconnect_delay_max = 60.0
-    supervise_reconnect = _env_bool("TG_SUPERVISE_RECONNECT", True)
-    reconnect_delay = float(_env_float("TG_RECONNECT_DELAY_INITIAL_SECONDS", reconnect_delay))
-    reconnect_delay_max = float(_env_float("TG_RECONNECT_DELAY_MAX_SECONDS", reconnect_delay_max))
     try:
-        while True:
-            try:
-                watchdog_bot = asyncio.create_task(_connection_watchdog(bot_client, "ManagerBot(bot)"))
-                watchdog_user = asyncio.create_task(_connection_watchdog(user_client, "ManagerBot(user)"))
-                await bot_client.run_until_disconnected()
-                for t in (watchdog_bot, watchdog_user):
-                    if not t.done():
-                        t.cancel()
-                        try:
-                            await t
-                        except Exception:
-                            pass
-                raise ConnectionError("bot_client disconnected")
-            except KeyboardInterrupt:
-                return
-            except Exception as e:
-                if not supervise_reconnect:
-                    raise
-                # Telethon 会尝试自动重连，但在网络波动/代理不稳时可能持续失败并退出。
-                # 这里增加一层“监督重启”，避免需要手动重开脚本。
-                logger.warning(f"管理 Bot 连接中断：{e}，{reconnect_delay:.0f}s 后重试…")
-
-                await asyncio.sleep(float(reconnect_delay))
-                reconnect_delay = min(reconnect_delay * 2.0, reconnect_delay_max)
-
-                try:
-                    if not await user_client.is_connected():
-                        await user_client.connect()
-                except Exception:
-                    pass
-
-                try:
-                    await bot_client.disconnect()
-                except Exception:
-                    pass
-                try:
-                    await bot_client.start(bot_token=bot_token)
-                    logger.info("管理 Bot 已恢复连接")
-                    reconnect_delay = 2.0
-                    continue
-                except Exception:
-                    continue
+        await bot_client.run_until_disconnected()
     finally:
         pending.clear()
         await runtime.stop()
@@ -1630,6 +1712,9 @@ async def main_async() -> None:
 def main() -> None:
     try:
         asyncio.run(main_async())
+    except RuntimeError as e:
+        print(f"❌ {e}")
+        sys.exit(1)
     except KeyboardInterrupt:
         sys.exit(0)
 

@@ -1,0 +1,47 @@
+version: "3.9"
+
+services:
+  tg-manager:
+    build: .
+    container_name: tg_manager
+    command: ["python", "-u", "manager_bot.py"]
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./sessions:/app/sessions
+      - ./downloads:/app/downloads
+      - ./logs:/app/logs
+      - ./rclone:/root/.config/rclone
+    restart: unless-stopped
+
+  tg-login:
+    build: .
+    container_name: tg_login
+    command: ["python", "-u", "setup_user_session.py"]
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./sessions:/app/sessions
+      - ./downloads:/app/downloads
+      - ./logs:/app/logs
+      - ./rclone:/root/.config/rclone
+    stdin_open: true
+    tty: true
+    profiles: ["tools"]
+
+  tg-rclone:
+    build: .
+    container_name: tg_rclone
+    entrypoint: ["rclone"]
+    command: ["version"]
+    env_file:
+      - .env
+    volumes:
+      - ./rclone:/root/.config/rclone
+      - ./downloads:/app/downloads
+      - ./logs:/app/logs
+    stdin_open: true
+    tty: true
+    profiles: ["tools"]
