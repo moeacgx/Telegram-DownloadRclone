@@ -197,6 +197,7 @@ class PendingTopicSelection:
     group_title: str
     topics: List[dict]
     query: str
+    hidden_count: int = 0
     page: int = 0
     selected: Set[int] = None
 
@@ -230,14 +231,34 @@ def _topic_selection_text(state: PendingTopicSelection, page_size: int) -> str:
     pages = max(1, (total + page_size - 1) // page_size)
     page = max(0, min(state.page, pages - 1))
     selected_count = len(state.selected)
+    hidden_line = f"已隐藏已添加：{int(state.hidden_count)}" if int(state.hidden_count or 0) > 0 else ""
     lines = [
         f"话题列表：{state.group_title} (chat_id={state.chat_id})",
         f"筛选关键词：{state.query or '（无）'}",
         f"页码：{page + 1}/{pages}，已选择：{selected_count}",
+        hidden_line,
         "",
         "点击按钮勾选/取消；点击“完成”写入工作列表。",
     ]
-    return "\n".join(lines)
+    return "\n".join([x for x in lines if str(x).strip() != ""])
+
+
+def _filter_existing_forum_topic_rows(db: Database, chat_id: int, topic_rows: List[dict]) -> tuple[List[dict], int]:
+    existing: Set[int] = set()
+    try:
+        for s in db.list_download_sources(active_only=False):
+            if str(s.get("source_type") or "") != "forum_topic":
+                continue
+            if int(s.get("chat_id") or 0) != int(chat_id):
+                continue
+            tid = int(s.get("topic_root_message_id") or 0)
+            if tid > 0:
+                existing.add(tid)
+    except Exception:
+        existing = set()
+
+    filtered = [t for t in (topic_rows or []) if int(t.get("id") or 0) not in existing]
+    return filtered, int(len(topic_rows or []) - len(filtered))
 
 
 def _topic_selection_buttons(state: PendingTopicSelection, page_size: int) -> List[List[Button]]:
@@ -605,27 +626,39 @@ async def main_async() -> None:
 
         status = str(prog.get("status") or "running")
         groups_done = int(prog.get("groups_done") or 0)
-        messages_scanned = int(prog.get("messages_scanned") or 0)
-        total_messages = int(prog.get("total_messages") or 0)
         current_msg_id = int(prog.get("current_message_id") or 0)
 
         # 简洁格式：统计数量而不是显示ID
-        lines = [f"📦 正在克隆频道: {title}"]
+        # 根据状态显示不同的标题
+        if status == "done":
+            lines = [f"✅ 克隆完成: {title}"]
+        elif status == "cancelled":
+            lines = [f"⏹️ 克隆已取消: {title}"]
+        elif status == "failed":
+            lines = [f"❌ 克隆失败: {title}"]
+        elif status in ("starting", "queued"):
+            lines = [f"📦 准备克隆频道: {title}"]
+        elif status == "retrying":
+            lines = [f"🔄 重试中: {title}"]
+        else:
+            lines = [f"📦 正在克隆频道: {title}"]
 
-        # 当前进度（已上传完成的最后一个消息ID）
+        # 当前进度：当前并发窗口中“最小未上传完成”的消息ID
         if current_msg_id > 0:
             lines.append(f"📍 当前进度: 消息 {current_msg_id}")
 
-        # 进度：显示已遍历消息数 / 预估总数
-        if total_messages > 0 and messages_scanned > 0:
-            progress_pct = int(messages_scanned * 100 / total_messages) if total_messages > 0 else 0
-            lines.append(f"📊 进度: 已遍历 {messages_scanned}/{total_messages} 条消息 ({progress_pct}%)")
-        elif messages_scanned > 0:
-            lines.append(f"📊 进度: 已遍历 {messages_scanned} 条消息")
+        # 进度：不再展示“遍历消息数”，仅展示媒体组完成数量（以 rclone 上传完成为准）
+        if status in ("done", "cancelled", "failed"):
+            if groups_done > 0:
+                lines.append(f"📊 进度: 已完成（共 {groups_done} 个媒体组）")
+            else:
+                lines.append(f"📊 进度: 已完成")
+        elif groups_done > 0:
+            lines.append(f"📊 进度: 进行中（已完成 {groups_done} 个媒体组）")
         else:
             lines.append(f"📊 进度: 初始化中…")
 
-        # 已完成媒体组数
+        # 已完成媒体组数（总是显示，提供更直观的进度信息）
         if groups_done > 0:
             lines.append(f"✅ 已完成媒体组: {groups_done}")
 
@@ -705,86 +738,41 @@ async def main_async() -> None:
         task: asyncio.Task,
         list_message_id: Optional[int] = None,
     ) -> None:
+        """简单的克隆通知（只通知开始和完成）"""
         try:
-            # 先发一条进度消息，后续不断编辑（不刷屏）
-            progress_msg = await bot_client.send_message(
+            # 发送开始消息
+            await bot_client.send_message(
                 int(chat_id),
-                _format_clone_progress_text(title, source_id),
+                f"📦 开始克隆频道：{title}",
                 buttons=_reply_menu_keyboard(),
             )
 
-            last_text: Optional[str] = None
-            last_list_refresh = 0.0
-            can_edit = True
-
-            while True:
-                done = task.done()
-                text = _format_clone_progress_text(title, source_id)
-                if text != last_text:
-                    if can_edit:
-                        try:
-                            await bot_client.edit_message(
-                                int(chat_id),
-                                int(progress_msg.id),
-                                text,
-                                buttons=_reply_menu_keyboard(),
-                            )
-                        except Exception:
-                            # 不能编辑就降级：后续不再 edit，避免 task 崩溃；仅在结束时发结果消息
-                            can_edit = False
-                    last_text = text
-
-                # 同步刷新“频道列表”那条消息（如果有）
-                if list_message_id and (time.time() - last_list_refresh) >= 6.0:
-                    try:
-                        list_text, list_buttons = generate_source_list_message(db, runtime)
-                        await bot_client.edit_message(int(chat_id), int(list_message_id), list_text, buttons=list_buttons)
-                    except Exception:
-                        pass
-                    last_list_refresh = time.time()
-
-                if done:
-                    break
-                await asyncio.sleep(2.0)
-
-            # 完成后补一次最终刷新
-            try:
-                list_text, list_buttons = generate_source_list_message(db, runtime)
-                if list_message_id:
-                    await bot_client.edit_message(int(chat_id), int(list_message_id), list_text, buttons=list_buttons)
-            except Exception:
-                pass
-
-            ok = False
-            err: Optional[Exception] = None
+            # 等待克隆完成
             try:
                 await task
                 ok = True
+                err = None
             except Exception as e:
                 ok = False
                 err = e
 
-            final_text = f"✅ 克隆完成并已开始监听：{title}" if ok else f"❌ 克隆失败：{title}\n原因：{err}"
-
-            if can_edit:
+            # 更新频道列表
+            if list_message_id:
                 try:
-                    await bot_client.edit_message(
-                        int(chat_id),
-                        int(progress_msg.id),
-                        final_text,
-                        buttons=_reply_menu_keyboard(),
-                    )
-                    return
+                    list_text, list_buttons = generate_source_list_message(db, runtime)
+                    await bot_client.edit_message(int(chat_id), int(list_message_id), list_text, buttons=list_buttons)
                 except Exception:
                     pass
 
+            # 发送完成通知
+            final_status = f"✅ 克隆完成并已开始监听：{title}" if ok else f"❌ 克隆失败：{title}\n原因：{err}"
             try:
-                await bot_client.send_message(int(chat_id), final_text, buttons=_reply_menu_keyboard())
+                await bot_client.send_message(int(chat_id), final_status, buttons=_reply_menu_keyboard())
             except Exception:
                 pass
-        except Exception:
-            # 绝不让后台 task 抛出未处理异常
-            return
+
+        except Exception as e:
+            print(f"\n[ERROR] 克隆处理失败: {e}\n", file=sys.stderr, flush=True)
 
     async def deny(event, text: str = "无权限") -> None:
         try:
@@ -860,12 +848,6 @@ async def main_async() -> None:
         task = runtime.start_clone(source_id, auto_listen=True, start_from_message_id=start_from_id)
         asyncio.create_task(_run_clone_with_progress(int(event.chat_id), source_id, title, task))
 
-        # 根据是否指定起始ID，显示不同的提示消息
-        if start_from_id:
-            await event.reply(f"已开始克隆：{title}\n从消息ID {start_from_id} 开始", buttons=_reply_menu_keyboard())
-        else:
-            await event.reply(f"已开始克隆：{title}", buttons=_reply_menu_keyboard())
-
     @bot_client.on(events.NewMessage(pattern=r"^/addchannel\s+(.+)$"))
     async def on_add_channel(event):
         if not is_admin(event.sender_id):
@@ -938,11 +920,17 @@ async def main_async() -> None:
                     }
                 )
 
+            topic_rows, hidden_count = _filter_existing_forum_topic_rows(db, chat_id, topic_rows)
+            if not topic_rows:
+                await event.reply("该群话题已全部添加，无需重复操作。")
+                return
+
             sel = PendingTopicSelection(
                 chat_id=chat_id,
                 group_title=str(group_title),
                 topics=topic_rows,
                 query=query,
+                hidden_count=hidden_count,
             )
             pending[int(event.sender_id)] = sel
             await event.reply(
@@ -1322,11 +1310,17 @@ async def main_async() -> None:
                             }
                         )
 
+                    topic_rows, hidden_count = _filter_existing_forum_topic_rows(db, int(group["chat_id"]), topic_rows)
+                    if not topic_rows:
+                        await event.answer("该群话题已全部添加，无需重复操作。", alert=True)
+                        return
+
                     sel = PendingTopicSelection(
                         chat_id=int(group["chat_id"]),
                         group_title=group_title,
                         topics=topic_rows,
                         query="",
+                        hidden_count=hidden_count,
                     )
                     pending[user_id] = sel
                     await event.edit(
@@ -1678,11 +1672,18 @@ async def main_async() -> None:
                             }
                         )
 
+                    topic_rows, hidden_count = _filter_existing_forum_topic_rows(db, chat_id, topic_rows)
+                    if not topic_rows:
+                        pending.pop(user_id, None)
+                        await event.reply("该群话题已全部添加，无需重复操作。", buttons=_reply_menu_keyboard())
+                        return
+
                     sel = PendingTopicSelection(
                         chat_id=chat_id,
                         group_title=str(group_title),
                         topics=topic_rows,
                         query=query,
+                        hidden_count=hidden_count,
                     )
                     pending[user_id] = sel
                     await event.reply(

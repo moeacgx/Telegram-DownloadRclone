@@ -656,7 +656,7 @@ class RcloneUploader:
     def __init__(self, cfg: AppConfig, db: Database) -> None:
         self._cfg = cfg
         self._db = db
-        self._queue: "asyncio.Queue[Tuple[int, str, Path, str]]" = asyncio.Queue()
+        self._queue: "asyncio.Queue[Tuple[int, str, Path, str, asyncio.Future[bool]]]" = asyncio.Queue()
         self._worker: Optional[asyncio.Task] = None
 
     def start(self) -> None:
@@ -672,18 +672,24 @@ class RcloneUploader:
             except asyncio.CancelledError:
                 pass
 
-    async def enqueue(self, source_id: int, group_uid: str, local_dir: Path, remote_dir: str) -> None:
-        await self._queue.put((int(source_id), str(group_uid), local_dir, remote_dir))
+    async def enqueue(
+        self, source_id: int, group_uid: str, local_dir: Path, remote_dir: str
+    ) -> "asyncio.Future[bool]":
+        fut: "asyncio.Future[bool]" = asyncio.get_running_loop().create_future()
+        await self._queue.put((int(source_id), str(group_uid), local_dir, str(remote_dir), fut))
+        return fut
 
     async def _run(self) -> None:
         while True:
-            source_id, group_uid, local_dir, remote_dir = await self._queue.get()
+            source_id, group_uid, local_dir, remote_dir, fut = await self._queue.get()
             try:
                 ok = await self._rclone_copy(local_dir, remote_dir)
                 if not ok:
                     self._db.mark_download_group_uploaded(
                         source_id, group_uid, uploaded=False, remote_dir=remote_dir, local_deleted=False
                     )
+                    if fut and (not fut.done()):
+                        fut.set_result(False)
                     continue
 
                 # 先标记“已上传”，避免删除本地失败时把整个组误记为 failed
@@ -717,9 +723,13 @@ class RcloneUploader:
 
                 if self._cfg.rclone_cleanup_db_after_upload:
                     self._db.delete_download_group(source_id, group_uid)
+                if fut and (not fut.done()):
+                    fut.set_result(True)
             except Exception as e:
                 logger.error(f"rclone 上传流程异常: {e}", exc_info=True)
                 self._db.mark_download_group_failed(source_id, group_uid, str(e))
+                if fut and (not fut.done()):
+                    fut.set_exception(e)
             finally:
                 self._queue.task_done()
 
@@ -785,21 +795,22 @@ async def download_media_group(
     group_semaphore: Optional[asyncio.Semaphore] = None,
     header_text: Optional[str] = None,
     prepared: Optional[PreparedDownloadGroup] = None,
-) -> None:
+) -> Tuple[bool, int, Optional[asyncio.Future[bool]]]:
     if not messages:
-        return
+        return False, 0, None
 
     if not any(getattr(m, "media", None) for m in messages):
-        return
+        return False, 0, None
 
     if group_semaphore is not None:
         await group_semaphore.acquire()
     prepared_group: Optional[PreparedDownloadGroup] = prepared
+    min_id = 0
     try:
         if prepared_group is None:
             prepared_group = _prepare_download_group(cfg, db, source_row, messages, header_text=header_text)
         if not prepared_group:
-            return
+            return False, 0, None
 
         source_title = str(source_row.get("display_title") or source_row.get("title") or source_row.get("chat_id") or "")
         message_ids = [int(getattr(m, "id", 0) or 0) for m in messages]
@@ -1087,10 +1098,12 @@ async def download_media_group(
             str(max_id),
         )
 
+        upload_fut: Optional[asyncio.Future[bool]] = None
         if cfg.rclone_enabled and prepared_group.remote_dir:
-            await uploader.enqueue(
+            upload_fut = await uploader.enqueue(
                 source_row["id"], prepared_group.group_uid, prepared_group.local_dir, prepared_group.remote_dir
             )
+        return True, int(min_id or 0), upload_fut
 
     except FloodWaitError as e:
         if prepared_group:
@@ -1107,6 +1120,7 @@ async def download_media_group(
             )
         logger.warning(f"触发 FloodWait，等待 {e.seconds}s")
         await asyncio.sleep(int(e.seconds))
+        return False, int(min_id or 0), None
     except Exception as e:
         if prepared_group:
             db.add_download_group(
@@ -1121,6 +1135,7 @@ async def download_media_group(
                 error_message=str(e),
             )
         logger.error(f"下载失败: {e}", exc_info=True)
+        return False, int(min_id or 0), None
     finally:
         if group_semaphore is not None:
             try:
@@ -1309,6 +1324,7 @@ class DownloaderRuntime:
 
         self._clone_tasks: Dict[int, asyncio.Task] = {}
         self._clone_progress: Dict[int, dict] = {}
+        self._clone_ui_callbacks: Dict[int, Callable] = {}  # UI更新回调
         self._last_header_text: Dict[int, str] = {}
         self._handler_installed = False
 
@@ -1343,9 +1359,32 @@ class DownloaderRuntime:
     def _update_clone_progress(self, source_id: int, **fields) -> None:
         source_id = int(source_id)
         current = self._clone_progress.get(source_id) or {}
+
+        # 检测 groups_done 是否真的变化了
+        old_groups_done = current.get('groups_done', 0)
+        new_groups_done = fields.get('groups_done', old_groups_done)
+        groups_done_changed = (new_groups_done != old_groups_done)
+
         current.update(fields)
         current["updated_at"] = float(time.time())
         self._clone_progress[source_id] = current
+
+        # 只在 groups_done 真正变化时触发UI回调
+        if source_id in self._clone_ui_callbacks and groups_done_changed:
+            try:
+                callback = self._clone_ui_callbacks[source_id]
+                # 异步调用回调
+                asyncio.create_task(callback(source_id, current))
+            except Exception as e:
+                logger.warning(f"UI回调执行失败: {e}")
+
+    def register_clone_ui_callback(self, source_id: int, callback: Callable) -> None:
+        """注册克隆进度UI更新回调"""
+        self._clone_ui_callbacks[int(source_id)] = callback
+
+    def unregister_clone_ui_callback(self, source_id: int) -> None:
+        """注销克隆进度UI更新回调"""
+        self._clone_ui_callbacks.pop(int(source_id), None)
 
     def refresh_sources_cache(self, force: bool = False) -> None:
         now = time.monotonic()
@@ -1484,10 +1523,33 @@ class DownloaderRuntime:
         if existing and not existing.done():
             return existing
 
+        # 预先计算初始消息ID,避免UI显示延迟
+        source = self._db.get_download_source(source_id)
+        if not source:
+            raise RuntimeError("来源不存在")
+
+        if start_from_message_id is not None:
+            init_msg_id = max(1, int(start_from_message_id or 1))
+        else:
+            last_msg = int(source.get("last_message_id") or 0)
+            # 对于话题,如果 last_message_id 为 0,尝试使用话题起始ID
+            if last_msg == 0 and source.get("source_type") == "forum_topic":
+                topic_start_id = int(source.get("topic_root_message_id") or source.get("topic_id") or 0)
+                if topic_start_id > 0:
+                    init_msg_id = topic_start_id
+                else:
+                    init_msg_id = 1
+            else:
+                init_msg_id = max(1, last_msg + 1)
+
         self._update_clone_progress(
             source_id,
             status="queued",
-            start_from_message_id=int(start_from_message_id or 0),
+            start_from_message_id=int(start_from_message_id or init_msg_id),
+            current_message_id=init_msg_id,  # 立即设置初始消息ID
+            groups_done=0,
+            messages_scanned=0,
+            total_messages=0,
         )
 
         task = asyncio.create_task(
@@ -1531,11 +1593,26 @@ class DownloaderRuntime:
                 self._db.set_download_source_last_message(source_id, max(0, start_from - 1))
                 source = self._db.get_download_source(source_id) or source
 
-        # 计算初始消息 ID，确保至少为 1，避免显示"计算中"
+        # 计算初始消息 ID,确保至少为 1,避免显示"计算中"
+        # 注意:start_clone 中已经预设了初始值,这里可以复用或重新计算(覆盖)
+        # 对于话题(forum_topic),起始ID应该基于话题的起始消息ID(reply_to)
+        prev_progress = self._clone_progress.get(source_id) or {}
         if start_from_message_id is not None:
             init_msg_id = max(1, int(start_from_message_id or 1))
+        elif int(prev_progress.get("current_message_id") or 0) > 0:
+            # 如果已经有初始值(在start_clone中设置),就复用
+            init_msg_id = int(prev_progress.get("current_message_id"))
         else:
-            init_msg_id = max(1, int(source.get("last_message_id") or 0) + 1)
+            last_msg = int(source.get("last_message_id") or 0)
+            # 对于话题,如果 last_message_id 为 0,尝试使用话题起始ID
+            if last_msg == 0 and source.get("source_type") == "forum_topic":
+                topic_start_id = int(source.get("topic_root_message_id") or source.get("topic_id") or 0)
+                if topic_start_id > 0:
+                    init_msg_id = topic_start_id
+                else:
+                    init_msg_id = 1
+            else:
+                init_msg_id = max(1, last_msg + 1)
 
         self._update_clone_progress(
             source_id,
@@ -1601,15 +1678,17 @@ class DownloaderRuntime:
                     # 只在媒体组完成时增加计数
                     if is_group_done:
                         groups_done += 1
-                        logger.info(f"媒体组完成: 消息ID={current_msg_id} 已完成组数={groups_done}")
+                        logger.info(f"媒体组上传完成: 已完成组数={groups_done}")
 
                     prev = self._clone_progress.get(int(source_id)) or {}
+                    new_msg_id = int(current_msg_id) if int(current_msg_id or 0) > 0 else int(prev.get("current_message_id") or 0)
+                    logger.info(f"更新克隆进度: source_id={source_id} status=running groups_done={groups_done} messages_scanned={messages_scanned} current_message_id={new_msg_id}")
                     self._update_clone_progress(
                         source_id,
                         status="running",
                         groups_done=groups_done,
                         messages_scanned=messages_scanned,
-                        current_message_id=int(current_msg_id) if int(current_msg_id or 0) > 0 else int(prev.get("current_message_id") or 0),
+                        current_message_id=new_msg_id,
                     )
 
                 await backfill_single_source(
@@ -1762,7 +1841,7 @@ async def backfill_single_source(
     download_semaphore: Optional[asyncio.Semaphore] = None,
     group_semaphore: Optional[asyncio.Semaphore] = None,
     start_from_message_id: Optional[int] = None,
-    progress_hook: Optional[Callable[[int], None]] = None,
+    progress_hook: Optional[Callable[..., None]] = None,
 ) -> None:
     chat_id = int(source["chat_id"])
     last_message_id = int(source.get("last_message_id") or 0)
@@ -1787,6 +1866,8 @@ async def backfill_single_source(
 
     inflight: Set[asyncio.Task] = set()
     max_inflight_groups = max(5, int(cfg.max_group_concurrency) * 2)
+    inflight_progress_ids: Set[int] = set()
+    upload_inflight: Set[asyncio.Future[bool]] = set()
 
     async def _drain_inflight_if_needed() -> None:
         nonlocal inflight
@@ -1808,6 +1889,7 @@ async def backfill_single_source(
         pending_header_text = None
 
     async def _flush_pending() -> None:
+        nonlocal message_count  # 声明访问外层的 message_count
         if not pending_messages:
             _reset_pending()
             return
@@ -1816,17 +1898,13 @@ async def backfill_single_source(
 
         messages_snapshot = list(pending_messages)
         header_snapshot = pending_header_text
+        # 使用“当前未上传完成的并发窗口最小消息ID”作为进度标记
+        min_id = int(min(m.id for m in messages_snapshot))
         last_id = int(max(m.id for m in messages_snapshot))
         _reset_pending()
 
-        if progress_hook:
-            try:
-                progress_hook(scanned_count=0, is_group_done=True, current_msg_id=last_id)
-            except Exception:
-                pass
-
-        # 这里按“消息遍历顺序”预分配日期/编号，避免并发导致 TG@BieLaoZai_002/009 这种乱序编号
-        # 运行中可能发生“重命名来源”等变更；这里每次落盘前以数据库最新值为准（主要是 display_title 影响目录名）。
+        # 这里按"消息遍历顺序"预分配日期/编号，避免并发导致 TG@BieLaoZai_002/009 这种乱序编号
+        # 运行中可能发生"重命名来源"等变更；这里每次落盘前以数据库最新值为准（主要是 display_title 影响目录名）。
         source_latest = db.get_download_source(int(source.get("id") or 0)) or source
         prepared = _prepare_download_group(cfg, db, source_latest, messages_snapshot, header_text=header_snapshot)
         if not prepared:
@@ -1846,6 +1924,61 @@ async def backfill_single_source(
                 prepared=prepared,
             )
         )
+
+        inflight_progress_ids.add(min_id)
+
+        def _notify_progress(is_group_done: bool, fallback_current: int) -> None:
+            if not progress_hook:
+                return
+            current = int(min(inflight_progress_ids)) if inflight_progress_ids else int(fallback_current or 0)
+            try:
+                progress_hook(scanned_count=message_count, is_group_done=is_group_done, current_msg_id=current)
+            except Exception:
+                pass
+
+        # 下载完成后：若启用 rclone，则等待 rclone 上传 future 完成再推进进度
+        if progress_hook:
+            def on_download_done(t: asyncio.Task) -> None:
+                try:
+                    if t.cancelled():
+                        inflight_progress_ids.discard(min_id)
+                        _notify_progress(is_group_done=False, fallback_current=min_id)
+                        return
+                    if t.exception() is not None:
+                        inflight_progress_ids.discard(min_id)
+                        _notify_progress(is_group_done=False, fallback_current=min_id)
+                        return
+
+                    ok, _pid, upload_fut = t.result()
+                    if not ok:
+                        inflight_progress_ids.discard(min_id)
+                        _notify_progress(is_group_done=False, fallback_current=min_id)
+                        return
+
+                    if upload_fut is None:
+                        inflight_progress_ids.discard(min_id)
+                        _notify_progress(is_group_done=True, fallback_current=min_id)
+                        return
+
+                    upload_inflight.add(upload_fut)
+
+                    def on_upload_done(f: asyncio.Future[bool]) -> None:
+                        try:
+                            upload_inflight.discard(f)
+                            upload_ok = False
+                            if not f.cancelled():
+                                upload_ok = bool(f.result())
+                        except Exception:
+                            upload_ok = False
+                        inflight_progress_ids.discard(min_id)
+                        _notify_progress(is_group_done=bool(upload_ok), fallback_current=min_id)
+
+                    upload_fut.add_done_callback(on_upload_done)
+                except Exception:
+                    pass
+
+            task.add_done_callback(on_download_done)
+
         inflight.add(task)
         await _drain_inflight_if_needed()
 
@@ -1882,7 +2015,6 @@ async def backfill_single_source(
 
     used_fallback = False
     message_count = 0  # 统计遍历到的消息数
-    last_progress_update = 0  # 上次进度更新的消息计数
     last_scanned_msg_id = 0
     try:
         logger.info(
@@ -1899,24 +2031,7 @@ async def backfill_single_source(
             if message_count <= 5 or message_count % 10 == 0:
                 logger.info(f"遍历消息: id={msg.id} has_media={bool(getattr(msg, 'media', None))}")
 
-            # 前几条消息更频繁更新，避免 UI 长时间停在“初始化中…”
-            if progress_hook and (message_count <= 5 or (message_count - last_progress_update) >= 10):
-                try:
-                    logger.debug(f"更新遍历进度: 消息ID={msg.id} 已遍历={message_count}条")
-                    progress_hook(scanned_count=message_count, is_group_done=False, current_msg_id=int(msg.id))
-                    last_progress_update = message_count
-                except Exception as e:
-                    logger.warning(f"更新进度失败: {e}")
-                    pass
-
             await _handle_message(msg)
-
-        # 遍历完成后，确保更新最终进度
-        if progress_hook and message_count > 0:
-            try:
-                progress_hook(scanned_count=message_count, is_group_done=False, current_msg_id=last_scanned_msg_id)
-            except Exception:
-                pass
 
         logger.info(f"消息遍历完成: source={source['id']} 共遍历 {message_count} 条消息")
     except Exception as e:
@@ -1974,6 +2089,8 @@ async def backfill_single_source(
 
     if inflight:
         await asyncio.gather(*list(inflight), return_exceptions=True)
+    if upload_inflight:
+        await asyncio.gather(*list(upload_inflight), return_exceptions=True)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
