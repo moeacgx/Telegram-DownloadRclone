@@ -54,6 +54,15 @@ docker compose --profile tools run --rm tg-rclone lsd pikpak:
 - `RCLONE_REMOTE=pikpak:`
 - （可选）`RCLONE_REMOTE_BASE_DIR=TGDownloads`
 
+如果你的 `rclone.conf` 里是 `type = pikpak`，需要使用“支持 pikpak 后端”的 rclone 版本。若宿主机已安装该版本，可在 `docker-compose.yml` 里把宿主机 rclone 挂载到容器（覆盖容器内自带的官方 rclone）。
+
+### 代理（Docker）
+
+如果你的代理跑在宿主机上，容器内不能用 `127.0.0.1` 访问宿主机代理端口。请把 `.env` 的 `PROXY_HOST` 改为：
+- `PROXY_HOST=host.docker.internal`
+
+并确认 `PROXY_PORT` 是代理的 socks5/http 监听端口。
+
 日志查看：
 
 ```bash
