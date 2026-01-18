@@ -11,9 +11,9 @@
 
 落盘结构：
 单媒体：
-<DOWNLOAD_ROOT_DIR>/<来源标题>/<YYYY-MM-DD>/<消息ID>.<ext>
+<DOWNLOAD_ROOT_DIR>/<来源标题>/<YYYY-MM-DD>/<FILE_PREFIX><消息ID>.<ext>
 相册（grouped_id）：
-<DOWNLOAD_ROOT_DIR>/<来源标题>/<YYYY-MM-DD>/TG@BieLaoZai_<最小消息ID>/<消息ID>.<ext>
+<DOWNLOAD_ROOT_DIR>/<来源标题>/<YYYY-MM-DD>/<FOLDER_PREFIX><最小消息ID>/<FILE_PREFIX><消息ID>.<ext>
 
 说明：
 - 序号按“来源+日期”id
@@ -73,6 +73,7 @@ class PreparedDownloadGroup:
     local_dir: Path
     remote_dir: Optional[str]
     last_message_id: int
+    media_file_prefix: str
 
 
 def _env_int(name: str, default: Optional[int] = None) -> Optional[int]:
@@ -97,6 +98,12 @@ def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
     if value is None or value == "":
         return default
     return str(value)
+
+
+def _env_str_allow_empty(name: str, default: Optional[str] = None) -> Optional[str]:
+    if name not in os.environ:
+        return default
+    return str(os.environ.get(name) or "")
 
 
 def _env_float(name: str, default: float) -> float:
@@ -158,6 +165,8 @@ class AppConfig:
     api_hash: str
     user_phone: Optional[str]
     download_root_dir: Path
+    media_folder_prefix: str
+    media_file_prefix: str
     media_group_flush_seconds: float
     max_download_concurrency: int
     max_group_concurrency: int
@@ -184,6 +193,8 @@ def load_config() -> AppConfig:
         raise RuntimeError("请在 .env 中配置 API_ID 与 API_HASH")
 
     download_root = _env_str("DOWNLOAD_ROOT_DIR", "downloads") or "downloads"
+    media_folder_prefix = _env_str_allow_empty("TG_MEDIA_FOLDER_PREFIX", "TG@BieLaoZai_") or ""
+    media_file_prefix = _env_str_allow_empty("TG_MEDIA_FILE_PREFIX", "TG@BieLaoZai_") or ""
     flush_seconds = _env_float("MEDIA_GROUP_FLUSH_SECONDS", 2.0)
     max_download = int(_env_int("MAX_DOWNLOAD_CONCURRENCY", 5) or 5)
     max_download = max(1, min(30, max_download))
@@ -207,6 +218,8 @@ def load_config() -> AppConfig:
         api_hash=str(api_hash),
         user_phone=user_phone,
         download_root_dir=Path(download_root),
+        media_folder_prefix=str(media_folder_prefix),
+        media_file_prefix=str(media_file_prefix),
         media_group_flush_seconds=float(flush_seconds),
         max_download_concurrency=int(max_download),
         max_group_concurrency=int(max_groups),
@@ -431,6 +444,37 @@ def _guess_media_ext(message) -> str:
     return ""
 
 
+def _build_media_file_stem(message_id: int, prefix: str) -> str:
+    prefix = str(prefix or "")
+    return f"{prefix}{int(message_id)}" if prefix else str(int(message_id))
+
+
+def _build_media_filename(message_id: int, ext: str, prefix: str) -> str:
+    return f"{_build_media_file_stem(int(message_id), prefix)}{str(ext or '')}"
+
+
+def _find_existing_media_file(
+    local_dir: Path,
+    message_id: int,
+    ext: str,
+    preferred_prefix: str,
+) -> Optional[Path]:
+    message_id = int(message_id)
+    if message_id <= 0:
+        return None
+    ext = str(ext or "")
+    preferred = local_dir / _build_media_filename(message_id, ext, preferred_prefix)
+    if preferred.exists() and preferred.is_file() and int(preferred.stat().st_size) > 0:
+        return preferred
+    try:
+        for p in local_dir.glob(f"*{message_id}{ext}"):
+            if p.exists() and p.is_file() and int(p.stat().st_size) > 0:
+                return p
+    except Exception:
+        return None
+    return None
+
+
 def _expected_media_size_bytes(message) -> Optional[int]:
     try:
         f = getattr(message, "file", None)
@@ -477,11 +521,20 @@ def _verify_group_files(prepared_group: PreparedDownloadGroup, source_id: int, m
             continue
         ext = _guess_media_ext(m)
         expected = _expected_media_size_bytes(m) if _verify_media_size() else None
-        path = prepared_group.local_dir / f"{mid}{ext}"
+        preferred = prepared_group.local_dir / _build_media_filename(mid, ext, prepared_group.media_file_prefix)
         try:
+            path = preferred
             if not path.exists() or not path.is_file() or int(path.stat().st_size) <= 0:
-                missing.append(mid)
-                continue
+                found = _find_existing_media_file(
+                    prepared_group.local_dir,
+                    mid,
+                    ext,
+                    prepared_group.media_file_prefix,
+                )
+                if not found:
+                    missing.append(mid)
+                    continue
+                path = found
             if _verify_media_size():
                 try:
                     _verify_downloaded_file_size(path, expected, label=f"source={source_id} msg_id={mid}")
@@ -885,29 +938,40 @@ async def download_media_group(
 
                     ext = _guess_media_ext(msg)
                     expected_size = _expected_media_size_bytes(msg)
-                    final_path = prepared_group.local_dir / f"{msg_id_prefix}{ext}"
+                    if msg_id > 0:
+                        target_stem = _build_media_file_stem(msg_id, prepared_group.media_file_prefix)
+                    else:
+                        prefix = str(prepared_group.media_file_prefix or "")
+                        target_stem = f"{prefix}{msg_id_prefix}" if prefix else msg_id_prefix
+                    final_path = prepared_group.local_dir / f"{target_stem}{ext}"
 
                     # 幂等：同一条消息的目标文件已存在则跳过（避免 Telethon 自动产生 (1)(2)...）
                     if msg_id > 0 and _skip_existing_media():
                         try:
-                            if final_path.exists() and final_path.is_file() and final_path.stat().st_size > 0:
+                            existing_path = _find_existing_media_file(
+                                prepared_group.local_dir,
+                                msg_id,
+                                ext,
+                                prepared_group.media_file_prefix,
+                            )
+                            if existing_path and existing_path.exists() and existing_path.is_file() and existing_path.stat().st_size > 0:
                                 if _verify_media_size():
                                     try:
                                         _verify_downloaded_file_size(
-                                            final_path,
+                                            existing_path,
                                             expected_size,
                                             label=f"source={source_row.get('id')} msg_id={msg_id_prefix}",
                                         )
                                         if should_log_each_download_message():
-                                            logger.info(f"跳过已存在的文件: {final_path} (大小验证通过)")
+                                            logger.info(f"跳过已存在的文件: {existing_path} (大小验证通过)")
                                         return  # 仅在验证通过后才跳过
                                     except ValueError:
                                         # 大小不对，文件已被删除，继续重新下载
-                                        logger.info(f"文件大小验证失败，将重新下载: {final_path}")
+                                        logger.info(f"文件大小验证失败，将重新下载: {existing_path}")
                                         pass
                                 else:
                                     if should_log_each_download_message():
-                                        logger.info(f"跳过已存在的文件: {final_path} (未启用大小验证)")
+                                        logger.info(f"跳过已存在的文件: {existing_path} (未启用大小验证)")
                                     return  # 不验证大小时，直接跳过
                         except Exception:
                             pass  # 其他异常（如文件损坏）也重新下载
@@ -959,7 +1023,7 @@ async def download_media_group(
 
                                     # 清理 Telethon 可能生成的重复文件（如 "9225 (1).mp4"）
                                     try:
-                                        for p in prepared_group.local_dir.glob(f"{msg_id_prefix} (*).*"):
+                                        for p in prepared_group.local_dir.glob(f"{target_stem} (*).*"):
                                             if p.is_file():
                                                 p.unlink(missing_ok=True)
                                     except Exception:
@@ -971,7 +1035,7 @@ async def download_media_group(
                                     except Exception:
                                         pass
                             else:
-                                target = prepared_group.local_dir / msg_id_prefix
+                                target = prepared_group.local_dir / target_stem
                                 _ACTIVE_MEDIA_DOWNLOADS += 1
                                 try:
                                     await _download_media_with_stall_guard(
@@ -1133,7 +1197,9 @@ async def download_media_group(
                     )
                 else:
                     ext = _guess_media_ext(media_msg)
-                    upload_path = prepared_group.local_dir / f"{msg_id}{ext}"
+                    upload_path = prepared_group.local_dir / _build_media_filename(
+                        msg_id, ext, prepared_group.media_file_prefix
+                    )
                     upload_fut = await uploader.enqueue(
                         source_row["id"],
                         prepared_group.group_uid,
@@ -1199,7 +1265,9 @@ def _prepare_download_group(
     is_album = grouped_id is not None
 
     folder_id = int(min(int(m.id) for m in messages))
-    preferred_folder = f"TG@BieLaoZai_{folder_id}"
+    preferred_folder = (
+        f"{cfg.media_folder_prefix}{folder_id}" if str(cfg.media_folder_prefix or "") else str(folder_id)
+    )
 
     group_uid = build_group_uid(chat_id, topic_root_message_id, grouped_id, messages[0].id)
     existing = db.get_download_group(int(source_row["id"]), str(group_uid))
@@ -1278,6 +1346,7 @@ def _prepare_download_group(
             local_dir=local_dir,
             remote_dir=str(remote_dir) if remote_dir else None,
             last_message_id=int(last_message_id),
+            media_file_prefix=str(cfg.media_file_prefix or ""),
         )
 
     text_for_date = header_text or _pick_text_for_date(messages)
@@ -1322,6 +1391,7 @@ def _prepare_download_group(
         local_dir=local_dir,
         remote_dir=remote_dir,
         last_message_id=int(last_message_id),
+        media_file_prefix=str(cfg.media_file_prefix or ""),
     )
 
 

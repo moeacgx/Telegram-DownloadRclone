@@ -33,6 +33,20 @@ docker compose --profile tools run --rm tg-login
 docker compose up -d tg-manager
 ```
 
+### 更新代码后重建（Docker）
+
+本项目默认不会把源码目录挂载进容器（镜像内通过 `COPY . /app` 打包代码），因此你修改 `bot.py/manager_bot.py` 等代码后，需要重建镜像：
+
+```bash
+docker compose up -d --build tg-manager
+```
+
+如需强制重建并重建容器（一般不必）：
+
+```bash
+docker compose up -d --build --force-recreate tg-manager
+```
+
 ### rclone 配置（容器内上传）
 
 本项目使用 `RCLONE_REMOTE`（例如 `pikpak:`）指向 rclone 的 remote 配置。Docker 场景下需要把 rclone 配置文件持久化到宿主机目录 `./rclone/`，并挂载到容器的 `/root/.config/rclone/`。
@@ -161,11 +175,14 @@ python bot.py --backfill
   <来源标题>/
     2024-12-22/
       TG@BieLaoZai_7304/
-      TG@BieLaoZai_7310/
+        TG@BieLaoZai_7304.jpg
+        TG@BieLaoZai_7305.mp4
+      TG@BieLaoZai_9999.mp4
 ```
 
 - `YYYY-MM-DD` 优先从消息文本中提取 `YYYY年MM月DD日`，否则使用消息发送日期。
-- `TG@BieLaoZai_<id>` 的前缀固定为 `TG@BieLaoZai`，`id` 为该媒体组中最小的消息 ID（便于从指定 ID 计算/定位，重启也不会“目录编号一直冲下去”）。
+- 相册子目录名与文件名前缀可配置（见 `.env` / `.env.example`）：`TG_MEDIA_FOLDER_PREFIX`、`TG_MEDIA_FILE_PREFIX`；留空则不加前缀。
+- 相册子目录 `<前缀><id>` 中的 `id` 为该相册最小的消息 ID（便于从指定 ID 计算/定位，重启也不会“目录编号一直冲下去”）。
 
 ## rclone 上传与自动删除
 
