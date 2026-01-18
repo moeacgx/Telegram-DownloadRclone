@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import deque
 import logging
 import logging.handlers
 import os
@@ -1384,6 +1385,9 @@ class DownloaderRuntime:
         self._clone_ui_callbacks: Dict[int, Callable] = {}  # UI更新回调
         self._last_header_text: Dict[int, str] = {}
         self._handler_installed = False
+        self._clone_enqueue_locks: Dict[int, asyncio.Lock] = {}
+        self._clone_enqueued: Dict[int, Dict[int, dict]] = {}
+        self._clone_enqueued_order: Dict[int, "deque[int]"] = {}
 
     def start(self) -> None:
         self._uploader.start()
@@ -1448,12 +1452,138 @@ class DownloaderRuntime:
         if not force and (now - self._sources_cache_ts) < self._sources_cache_ttl:
             return
 
-        sources = self._db.list_download_sources(active_only=True)
+        sources = self._db.list_download_sources(active_only=False)
         by_chat: Dict[int, List[dict]] = {}
         for s in sources:
             by_chat.setdefault(int(s["chat_id"]), []).append(s)
         self._sources_by_chat = by_chat
         self._sources_cache_ts = now
+
+    def _get_clone_enqueue_lock(self, source_id: int) -> asyncio.Lock:
+        source_id = int(source_id)
+        lock = self._clone_enqueue_locks.get(source_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._clone_enqueue_locks[source_id] = lock
+        return lock
+
+    async def _enqueue_media_group_after_clone(
+        self,
+        source_id: int,
+        group_key: int,
+        header_text: Optional[str],
+        messages: List,
+    ) -> None:
+        source_id = int(source_id)
+        group_key = int(group_key)
+        message_ids = {int(getattr(m, "id", 0) or 0) for m in messages if int(getattr(m, "id", 0) or 0) > 0}
+        if not message_ids:
+            return
+
+        async with self._get_clone_enqueue_lock(source_id):
+            by_key = self._clone_enqueued.setdefault(source_id, {})
+            order = self._clone_enqueued_order.setdefault(source_id, deque())
+            entry = by_key.get(group_key)
+            if entry is None:
+                by_key[group_key] = {
+                    "header_text": header_text,
+                    "message_ids": set(message_ids),
+                    "enqueued_at": float(time.time()),
+                }
+                order.append(group_key)
+                return
+
+            entry["message_ids"].update(message_ids)
+            if (not entry.get("header_text")) and header_text:
+                entry["header_text"] = header_text
+
+    async def _drain_enqueued_groups_after_clone(
+        self,
+        source_id: int,
+        on_group_done: Optional[Callable[[int], None]] = None,
+    ) -> int:
+        source_id = int(source_id)
+        drained = 0
+
+        source = self._db.get_download_source(source_id)
+        if not source:
+            return 0
+
+        chat_id = int(source["chat_id"])
+        entity = await self._client.get_entity(chat_id)
+
+        while True:
+            group_key = None
+            entry = None
+            async with self._get_clone_enqueue_lock(source_id):
+                order = self._clone_enqueued_order.get(source_id)
+                if not order:
+                    break
+                group_key = int(order.popleft())
+                entry = (self._clone_enqueued.get(source_id) or {}).pop(group_key, None)
+                if self._clone_enqueued.get(source_id) == {}:
+                    self._clone_enqueued.pop(source_id, None)
+                if self._clone_enqueued_order.get(source_id) and len(self._clone_enqueued_order[source_id]) == 0:
+                    self._clone_enqueued_order.pop(source_id, None)
+
+            if not entry:
+                continue
+
+            msg_ids = sorted(int(x) for x in (entry.get("message_ids") or set()) if int(x) > 0)
+            if not msg_ids:
+                continue
+
+            fetched = await self._client.get_messages(entity, ids=msg_ids)
+            if fetched is None:
+                continue
+            messages_list = fetched if isinstance(fetched, list) else [fetched]
+            messages_list = [m for m in messages_list if m is not None]
+            if not messages_list:
+                continue
+            messages_list.sort(key=lambda m: int(getattr(m, "id", 0) or 0))
+
+            header = entry.get("header_text")
+            source_latest = self._db.get_download_source(source_id) or source
+            prepared = _prepare_download_group(self._cfg, self._db, source_latest, messages_list, header_text=header)
+            ok, min_id, upload_fut = await download_media_group(
+                self._client,
+                self._cfg,
+                self._db,
+                source_latest,
+                messages_list,
+                self._uploader,
+                download_semaphore=self._download_semaphore,
+                group_semaphore=self._group_semaphore,
+                header_text=header,
+                prepared=prepared,
+            )
+            upload_ok = True
+            if upload_fut is not None:
+                try:
+                    upload_ok = bool(await upload_fut)
+                except Exception:
+                    upload_ok = False
+            if ok and upload_ok:
+                drained += 1
+                if on_group_done:
+                    try:
+                        on_group_done(int(min_id or 0))
+                    except Exception:
+                        pass
+
+        return drained
+
+    async def _drain_clone_queue_until_idle(
+        self,
+        source_id: int,
+        on_group_done: Optional[Callable[[int], None]] = None,
+    ) -> int:
+        total = 0
+        idle = max(0.5, float(self._cfg.media_group_flush_seconds))
+        total += int(await self._drain_enqueued_groups_after_clone(int(source_id), on_group_done=on_group_done))
+        await asyncio.sleep(idle)
+        total += int(await self._drain_enqueued_groups_after_clone(int(source_id), on_group_done=on_group_done))
+        return total
 
     async def download_media_messages(self, source_id: int, messages: List, header_text: Optional[str] = None) -> None:
         source = self._db.get_download_source(int(source_id))
@@ -1526,7 +1656,7 @@ class DownloaderRuntime:
 
         for source in candidates:
             source_id = int(source["id"])
-            if self.is_cloning(source_id):
+            if (not bool(source.get("is_active"))) and (not self.is_cloning(source_id)):
                 continue
 
             if source["source_type"] == "forum_topic":
@@ -1554,6 +1684,9 @@ class DownloaderRuntime:
             )
 
     async def _on_media_group(self, source_id: int, group_key: int, header_text: Optional[str], messages: List) -> None:
+        if self.is_cloning(int(source_id)):
+            await self._enqueue_media_group_after_clone(int(source_id), int(group_key), header_text, messages)
+            return
         source = self._db.get_download_source(int(source_id))
         if not source:
             return
@@ -1639,6 +1772,10 @@ class DownloaderRuntime:
         if not source:
             raise RuntimeError("来源不存在")
 
+        async with self._get_clone_enqueue_lock(source_id):
+            self._clone_enqueued.pop(source_id, None)
+            self._clone_enqueued_order.pop(source_id, None)
+
         # 清理旧的失败记录，避免重启后显示旧的失败数据
         self._db.clear_failed_download_groups(source_id)
 
@@ -1683,8 +1820,9 @@ class DownloaderRuntime:
             start_from_message_id=int(start_from_message_id or init_msg_id),
         )
 
-        # 克隆期间暂停监听，避免并发重复下载；仅在成功后再开启监听
+        # 克隆期间：来源置为 inactive；新消息仍会被捕获，但媒体组会排队到克隆完成后再处理，避免并发重复下载
         self._db.set_download_source_active(source_id, False)
+        self.refresh_sources_cache(force=True)
         ok = False
         attempts = max(1, int(_clone_retry_attempts()))
         last_err: Optional[Exception] = None
@@ -1694,6 +1832,7 @@ class DownloaderRuntime:
                 if not await ensure_connected(self._client, "Clone"):
                     raise ConnectionError("Telegram 未连接或未授权")
 
+                max_clone_message_id: Optional[int] = None
                 # 预估最新消息ID和总消息数（用于进度展示）
                 try:
                     entity = await self._client.get_entity(int(source["chat_id"]))
@@ -1705,6 +1844,8 @@ class DownloaderRuntime:
                     async for m in self._client.iter_messages(entity, limit=1, reply_to=reply_to):
                         latest_id = int(getattr(m, "id", 0) or 0)
                         break
+                    if latest_id > 0:
+                        max_clone_message_id = int(latest_id)
 
                     # 计算预估总消息数（最新ID - 起始ID，这只是粗略估计）
                     estimated_total = max(0, latest_id - init_msg_id + 1) if latest_id > 0 else 0
@@ -1748,6 +1889,13 @@ class DownloaderRuntime:
                         current_message_id=new_msg_id,
                     )
 
+                def on_queued_group_done(min_msg_id: int) -> None:
+                    on_message_progress(
+                        scanned_count=messages_scanned,
+                        is_group_done=True,
+                        current_msg_id=int(min_msg_id or 0),
+                    )
+
                 await backfill_single_source(
                     self._client,
                     self._cfg,
@@ -1757,21 +1905,13 @@ class DownloaderRuntime:
                     download_semaphore=self._download_semaphore,
                     group_semaphore=self._group_semaphore,
                     start_from_message_id=start_from_message_id,
+                    max_message_id=max_clone_message_id,
                     progress_hook=on_message_progress,
                 )
-                # 再跑一次兜底 catch-up，降低"克隆过程中新增消息漏掉"的概率
-                source2 = self._db.get_download_source(source_id) or source
-                await backfill_single_source(
-                    self._client,
-                    self._cfg,
-                    self._db,
-                    source2,
-                    self._uploader,
-                    download_semaphore=self._download_semaphore,
-                    group_semaphore=self._group_semaphore,
-                    start_from_message_id=None,
-                    progress_hook=on_message_progress,
-                )
+
+                queued_done = await self._drain_clone_queue_until_idle(source_id, on_group_done=on_queued_group_done)
+                if queued_done > 0:
+                    logger.info("克隆期间入队的新增媒体组已处理完成: source=%s count=%s", str(source_id), str(queued_done))
 
                 self._update_clone_progress(source_id, status="done", finished_at=float(time.time()))
                 ok = True
@@ -1779,6 +1919,9 @@ class DownloaderRuntime:
                 break
             except asyncio.CancelledError:
                 self._update_clone_progress(source_id, status="cancelled", finished_at=float(time.time()))
+                async with self._get_clone_enqueue_lock(source_id):
+                    self._clone_enqueued.pop(source_id, None)
+                    self._clone_enqueued_order.pop(source_id, None)
                 raise
             except ConnectionError as e:
                 last_err = e
@@ -1804,10 +1947,16 @@ class DownloaderRuntime:
             err = last_err or RuntimeError("克隆失败（未知原因）")
             self._update_clone_progress(source_id, status="failed", last_error=str(err), finished_at=float(time.time()))
             logger.error(f"克隆失败: source={source_id} err={err}", exc_info=True)
+            async with self._get_clone_enqueue_lock(source_id):
+                self._clone_enqueued.pop(source_id, None)
+                self._clone_enqueued_order.pop(source_id, None)
             raise err
         if auto_listen and ok:
             self._db.set_download_source_active(source_id, True)
         self.refresh_sources_cache(force=True)
+        async with self._get_clone_enqueue_lock(source_id):
+            self._clone_enqueued.pop(source_id, None)
+            self._clone_enqueued_order.pop(source_id, None)
 
 
 async def run_downloader(backfill: bool) -> None:
@@ -1898,6 +2047,7 @@ async def backfill_single_source(
     download_semaphore: Optional[asyncio.Semaphore] = None,
     group_semaphore: Optional[asyncio.Semaphore] = None,
     start_from_message_id: Optional[int] = None,
+    max_message_id: Optional[int] = None,
     progress_hook: Optional[Callable[..., None]] = None,
 ) -> None:
     chat_id = int(source["chat_id"])
@@ -2073,6 +2223,10 @@ async def backfill_single_source(
     used_fallback = False
     message_count = 0  # 统计遍历到的消息数
     last_scanned_msg_id = 0
+    max_id = None
+    if max_message_id is not None and int(max_message_id) > 0:
+        # Telethon 的 max_id 是“严格小于”，这里用 max+1 实现包含 max
+        max_id = int(max_message_id) + 1
     try:
         logger.info(
             f"开始遍历消息: source={source['id']} min_id={last_message_id} reply_to={reply_to} source_type={source.get('source_type')}"
@@ -2080,6 +2234,7 @@ async def backfill_single_source(
         async for msg in client.iter_messages(
             entity,
             min_id=last_message_id,
+            max_id=max_id,
             reverse=True,
             reply_to=reply_to,
         ):
@@ -2129,6 +2284,7 @@ async def backfill_single_source(
         async for msg in client.iter_messages(
             entity,
             min_id=last_message_id,
+            max_id=max_id,
             reverse=True,
             reply_to=None,
         ):
