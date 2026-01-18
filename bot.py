@@ -10,7 +10,10 @@
 - 可选：下载完成后 rclone copy 上传到 remote，成功后删除本地
 
 落盘结构：
-<DOWNLOAD_ROOT_DIR>/<来源标题>/<YYYY-MM-DD>/TG@BieLaoZai_id/...
+单媒体：
+<DOWNLOAD_ROOT_DIR>/<来源标题>/<YYYY-MM-DD>/<消息ID>.<ext>
+相册（grouped_id）：
+<DOWNLOAD_ROOT_DIR>/<来源标题>/<YYYY-MM-DD>/TG@BieLaoZai_<最小消息ID>/<消息ID>.<ext>
 
 说明：
 - 序号按“来源+日期”id
@@ -705,7 +708,10 @@ class RcloneUploader:
                         last_err: Optional[Exception] = None
                         for attempt in range(6):
                             try:
-                                shutil.rmtree(local_dir, ignore_errors=False)
+                                if local_dir.is_dir():
+                                    shutil.rmtree(local_dir, ignore_errors=False)
+                                else:
+                                    local_dir.unlink()
                                 deleted = True
                                 last_err = None
                                 break
@@ -849,7 +855,15 @@ async def download_media_group(
             # 改为：重试时不清空，依赖文件级检查（跳过已完成文件，重新下载缺失/损坏文件）
 
             if should_clear:
-                ensure_empty_dir(prepared_group.local_dir)
+                if prepared_group.group_folder:
+                    ensure_empty_dir(prepared_group.local_dir)
+                else:
+                    logger.info(
+                        "检测到失败记录，但当前为日期共享目录，跳过清空: %s",
+                        str(prepared_group.local_dir),
+                    )
+
+            prepared_group.local_dir.mkdir(parents=True, exist_ok=True)
 
             sem = download_semaphore or asyncio.Semaphore(cfg.max_download_concurrency)
 
@@ -1100,9 +1114,31 @@ async def download_media_group(
 
         upload_fut: Optional[asyncio.Future[bool]] = None
         if cfg.rclone_enabled and prepared_group.remote_dir:
-            upload_fut = await uploader.enqueue(
-                source_row["id"], prepared_group.group_uid, prepared_group.local_dir, prepared_group.remote_dir
-            )
+            if prepared_group.group_folder:
+                upload_fut = await uploader.enqueue(
+                    source_row["id"],
+                    prepared_group.group_uid,
+                    prepared_group.local_dir,
+                    prepared_group.remote_dir,
+                )
+            else:
+                media_msg = next((m for m in messages if getattr(m, "media", None)), None)
+                msg_id = int(getattr(media_msg, "id", 0) or 0) if media_msg is not None else 0
+                if msg_id <= 0:
+                    logger.warning(
+                        "单媒体组无法确定 msg_id，跳过 rclone 上传: source=%s group_uid=%s",
+                        str(source_row.get("id")),
+                        str(prepared_group.group_uid),
+                    )
+                else:
+                    ext = _guess_media_ext(media_msg)
+                    upload_path = prepared_group.local_dir / f"{msg_id}{ext}"
+                    upload_fut = await uploader.enqueue(
+                        source_row["id"],
+                        prepared_group.group_uid,
+                        upload_path,
+                        prepared_group.remote_dir,
+                    )
         return True, int(min_id or 0), upload_fut
 
     except FloodWaitError as e:
@@ -1159,6 +1195,7 @@ def _prepare_download_group(
     chat_id = int(source_row["chat_id"])
     topic_root_message_id = source_row.get("topic_id") or source_row.get("topic_root_message_id")
     grouped_id = getattr(messages[0], "grouped_id", None)
+    is_album = grouped_id is not None
 
     folder_id = int(min(int(m.id) for m in messages))
     preferred_folder = f"TG@BieLaoZai_{folder_id}"
@@ -1197,11 +1234,14 @@ def _prepare_download_group(
         if seq <= 0 or local_dir is None:
             seq = folder_id
 
-        group_folder = local_dir.name if local_dir else preferred_folder
-
         source_title = sanitize_path_component(source_row.get("display_title") or f"chat_{abs(chat_id)}")
+        base_dir = cfg.download_root_dir / source_title / date_str
+        if local_dir is not None:
+            group_folder = "" if local_dir.name == date_str else local_dir.name
+        else:
+            group_folder = preferred_folder if is_album else ""
         if local_dir is None:
-            local_dir = cfg.download_root_dir / source_title / date_str / group_folder
+            local_dir = base_dir / group_folder if group_folder else base_dir
 
         remote_dir = existing.get("remote_dir")
         # 兼容旧数据：remote_dir 若缺少 `<name>:` 前缀则视为无效，重新按当前配置生成
@@ -1258,10 +1298,11 @@ def _prepare_download_group(
         date_str = extracted_date
 
     seq = folder_id
-    group_folder = preferred_folder
+    group_folder = preferred_folder if is_album else ""
 
     source_title = sanitize_path_component(source_row.get("display_title") or f"chat_{abs(chat_id)}")
-    local_dir = cfg.download_root_dir / source_title / date_str / group_folder
+    base_dir = cfg.download_root_dir / source_title / date_str
+    local_dir = base_dir / group_folder if group_folder else base_dir
 
     remote_dir = None
     if cfg.rclone_enabled:
