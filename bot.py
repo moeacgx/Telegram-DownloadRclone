@@ -10,10 +10,10 @@
 - 可选：下载完成后 rclone copy 上传到 remote，成功后删除本地
 
 落盘结构：
-<DOWNLOAD_ROOT_DIR>/<来源标题>/<YYYY-MM-DD>/TG@BieLaoZai_001/...
+<DOWNLOAD_ROOT_DIR>/<来源标题>/<YYYY-MM-DD>/TG@BieLaoZai_id/...
 
 说明：
-- 序号按“来源+日期”递增（001/002/...）
+- 序号按“来源+日期”id
 - 日期仅从消息文本/标题中提取 `YYYY年MM月DD日`，不再回退到消息发送日期
 """
 
@@ -1284,17 +1284,33 @@ def _prepare_download_group(
 
 
 def _message_in_topic(message, topic_root_message_id: int) -> bool:
-    header = getattr(message, "reply_to", None)
-    if not header:
+    topic_root_message_id = int(topic_root_message_id or 0)
+    if topic_root_message_id <= 0:
         return False
 
-    top_id = getattr(header, "reply_to_top_id", None)
+    # 某些客户端/消息类型（尤其是相册 grouped_id）在 forum 话题内可能没有 reply_to header；
+    # 这里做多路径提取，尽量稳定识别“属于哪个话题(thread/top msg id)”。
+    top_id: Optional[int] = None
+    reply_id: Optional[int] = None
+
+    header = getattr(message, "reply_to", None)
+    if header is not None:
+        top_id = getattr(header, "reply_to_top_id", None)
+        if top_id is None:
+            top_id = getattr(header, "top_msg_id", None)
+        reply_id = getattr(header, "reply_to_msg_id", None)
+
     if top_id is None:
-        top_id = getattr(header, "top_msg_id", None)
+        top_id = getattr(message, "reply_to_top_id", None)
+    if top_id is None:
+        top_id = getattr(message, "top_msg_id", None)
+    if reply_id is None:
+        reply_id = getattr(message, "reply_to_msg_id", None)
 
-    reply_id = getattr(header, "reply_to_msg_id", None)
+    # 话题根消息本身可能没有 reply_to，但它的 message.id 就是 thread/top id
+    msg_id = int(getattr(message, "id", 0) or 0)
 
-    return int(top_id or reply_id or 0) == int(topic_root_message_id)
+    return int(top_id or reply_id or msg_id or 0) == topic_root_message_id
 
 
 class DownloaderRuntime:
