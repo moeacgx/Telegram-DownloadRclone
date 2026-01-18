@@ -717,9 +717,42 @@ class RcloneUploader:
         self._worker: Optional[asyncio.Task] = None
 
     def start(self) -> None:
+        self._ensure_worker_running(reason="start")
+
+    def _ensure_worker_running(self, *, reason: str) -> None:
         if not self._cfg.rclone_enabled:
             return
+        if self._worker is not None and (not self._worker.done()):
+            return
+
+        if self._worker is not None and self._worker.done():
+            err: Optional[BaseException] = None
+            try:
+                err = self._worker.exception()
+            except asyncio.CancelledError:
+                err = asyncio.CancelledError()
+            except Exception:
+                err = None
+            if err is None:
+                logger.warning("rclone worker 已退出，将自动重启（原因=%s）", str(reason))
+            else:
+                logger.error("rclone worker 异常退出，将自动重启（原因=%s err=%s）", str(reason), str(err))
+
         self._worker = asyncio.create_task(self._run())
+        self._worker.add_done_callback(self._on_worker_done)
+
+    def _on_worker_done(self, t: asyncio.Task) -> None:
+        try:
+            if t.cancelled():
+                logger.warning("rclone worker 已取消退出")
+                return
+            exc = t.exception()
+            if exc is None:
+                logger.warning("rclone worker 已退出（无异常）")
+            else:
+                logger.error("rclone worker 已退出（异常）：%s", str(exc), exc_info=True)
+        except Exception:
+            logger.error("rclone worker 退出状态获取失败", exc_info=True)
 
     async def stop(self) -> None:
         if self._worker:
@@ -728,10 +761,12 @@ class RcloneUploader:
                 await self._worker
             except asyncio.CancelledError:
                 pass
+        self._worker = None
 
     async def enqueue(
         self, source_id: int, group_uid: str, local_dir: Path, remote_dir: str
     ) -> "asyncio.Future[bool]":
+        self._ensure_worker_running(reason="enqueue")
         fut: "asyncio.Future[bool]" = asyncio.get_running_loop().create_future()
         await self._queue.put((int(source_id), str(group_uid), local_dir, str(remote_dir), fut))
         return fut
@@ -1206,6 +1241,13 @@ async def download_media_group(
                         upload_path,
                         prepared_group.remote_dir,
                     )
+        elif cfg.rclone_enabled and (not prepared_group.remote_dir):
+            logger.warning(
+                "rclone 已启用但 remote_dir 为空，跳过上传: source=%s group_uid=%s local=%s",
+                str(source_row.get("id")),
+                str(prepared_group.group_uid),
+                str(prepared_group.local_dir),
+            )
         return True, int(min_id or 0), upload_fut
 
     except FloodWaitError as e:
