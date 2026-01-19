@@ -262,7 +262,7 @@ class Database:
                 SELECT id, source_type, chat_id, topic_id, topic_root_message_id, display_title, is_active, last_message_id
                 FROM download_sources
                 WHERE is_active=1
-                ORDER BY id ASC
+                ORDER BY id DESC
                 """
             )
         else:
@@ -270,7 +270,7 @@ class Database:
                 """
                 SELECT id, source_type, chat_id, topic_id, topic_root_message_id, display_title, is_active, last_message_id
                 FROM download_sources
-                ORDER BY id ASC
+                ORDER BY id DESC
                 """
             )
         rows = cursor.fetchall()
