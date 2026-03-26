@@ -59,7 +59,6 @@ def load_config():
     required_fields = {
         'API_ID': config['api_id'],
         'API_HASH': config['api_hash'],
-        'USER_PHONE': config['user_phone'],
     }
 
     for env_name, value in required_fields.items():
@@ -167,6 +166,11 @@ async def login_user(config):
 
     # 开始登录流程
     phone = config['user_phone']
+    if not phone:
+        phone = input("\n请输入手机号（含国家码，如 +86...）：").strip()
+        if not phone:
+            print("❌ 手机号不能为空")
+            sys.exit(1)
     print(f"\n📱 手机号: {phone}")
     print("正在发送验证码...")
 

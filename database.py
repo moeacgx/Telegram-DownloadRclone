@@ -329,6 +329,59 @@ class Database:
         self.conn.commit()
         return cursor.rowcount > 0
 
+    def refresh_download_source_last_message_from_groups(self, source_id: Optional[int] = None) -> int:
+        """从 download_groups 对账 last_message_id，避免异常中断导致进度落后。"""
+        cursor = self.conn.cursor()
+        if source_id is not None:
+            cursor.execute(
+                """
+                SELECT MAX(last_message_id)
+                FROM download_groups
+                WHERE source_id=? AND status!='failed'
+                """,
+                (int(source_id),),
+            )
+            row = cursor.fetchone()
+            max_id = int(row[0] or 0) if row else 0
+            if max_id > 0:
+                cursor.execute(
+                    """
+                    UPDATE download_sources
+                    SET last_message_id=CASE WHEN last_message_id < ? THEN ? ELSE last_message_id END,
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE id=?
+                    """,
+                    (int(max_id), int(max_id), int(source_id)),
+                )
+            self.conn.commit()
+            return int(max_id)
+
+        cursor.execute(
+            """
+            SELECT source_id, MAX(last_message_id)
+            FROM download_groups
+            WHERE status!='failed'
+            GROUP BY source_id
+            """
+        )
+        rows = cursor.fetchall()
+        for r in rows:
+            sid = int(r[0])
+            max_id = int(r[1] or 0)
+            if max_id <= 0:
+                continue
+            cursor.execute(
+                """
+                UPDATE download_sources
+                SET last_message_id=CASE WHEN last_message_id < ? THEN ? ELSE last_message_id END,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=?
+                """,
+                (int(max_id), int(max_id), int(sid)),
+            )
+        self.conn.commit()
+        return int(len(rows or []))
+
     def set_download_source_display_title(self, source_id: int, display_title: str) -> bool:
         cursor = self.conn.cursor()
         cursor.execute(

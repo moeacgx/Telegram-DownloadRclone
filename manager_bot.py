@@ -10,20 +10,22 @@
 
 依赖：
 - 必须配置 `.env`：API_ID / API_HASH / BOT_TOKEN / ADMIN_USER_IDS
-- 必须先生成用户会话：`python setup_user_session.py`（用于读取频道/群组/话题信息）
+- 用户会话可通过 Bot 扫码登录生成（或使用 `python setup_user_session.py`）
 """
 
 from __future__ import annotations
 
 import asyncio
+import io
 import os
 import re
 import sys
 import time
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from dotenv import load_dotenv
 
@@ -33,7 +35,13 @@ except ImportError:
     socks = None
 
 from telethon import TelegramClient, events, functions, Button
+from telethon.errors import SessionPasswordNeededError
 from telethon.errors.rpcerrorlist import MessageNotModifiedError, ReplyMarkupInvalidError
+
+try:
+    import qrcode
+except Exception:
+    qrcode = None
 
 from database import Database
 from bot import DownloaderRuntime, load_config as load_downloader_config, sanitize_path_component, setup_logging
@@ -209,13 +217,27 @@ class PendingTopicSelection:
 PendingState = Union[PendingTextInput, PendingTopicSelection]
 
 
+@dataclass
+class QrLoginState:
+    admin_id: int
+    chat_id: int
+    qr: Any
+    qr_url: str
+    expires_at: float
+    started_at: float
+    message_id: Optional[int] = None
+    status: str = "pending"
+    error: Optional[str] = None
+    task: Optional[asyncio.Task] = field(default=None, repr=False)
+
+
 def _reply_menu_keyboard() -> List[List[Button]]:
     kw = {"resize": True, "persistent": True, "placeholder": "选择操作…"}
     return [
         [Button.text("添加频道", **kw), Button.text("添加群话题", **kw)],
         [Button.text("频道列表", **kw), Button.text("超级群组列表", **kw)],
-        [Button.text("状态", **kw), Button.text("帮助", **kw)],
-        [Button.text("菜单", **kw)],
+        [Button.text("账号登录", **kw), Button.text("状态", **kw)],
+        [Button.text("帮助", **kw), Button.text("菜单", **kw)],
     ]
 
 
@@ -297,6 +319,7 @@ def _topic_selection_buttons(state: PendingTopicSelection, page_size: int) -> Li
 def generate_source_list_message(
     db: Database,
     runtime: DownloaderRuntime,
+    user_ready: bool = True,
     page: int = 0,
     page_size: int = 8,
 ) -> tuple[str, List[List[Button]]]:
@@ -318,6 +341,8 @@ def generate_source_list_message(
     sources_page = sources[start:end]
 
     text_lines: List[str] = [f"📋 频道/话题列表（{page + 1}/{pages}）\n"]
+    if not user_ready:
+        text_lines.append("⚠️ 账号未登录，列表仅展示，操作将被禁用。\n")
     buttons: List[List[Button]] = []
 
     for source in sources_page:
@@ -535,11 +560,13 @@ def _help_text() -> str:
     return (
         "管理方式：\n"
         "- 推荐：使用输入框下方的菜单键盘（/start 或 /menu）\n"
+        "- 账号登录：菜单中选择“账号登录”，或使用 /login 生成二维码\n"
         "- 频道列表里可：暂停/恢复监听、点击“克隆”（历史下载），克隆完成自动切换监听\n"
         "- 超级群组列表：保存群组快捷记录，一键重新拉取话题并选择加入工作列表\n"
         "- 兼容：仍支持文本命令（不推荐）\n"
         "\n"
         "文本命令：\n"
+        "/login   # 生成扫码登录二维码\n"
         "/addchannel <频道用户名/链接/ID>\n"
         "/addgroup <群组用户名/链接/ID> [可选关键词过滤]\n"
         "/sources  # 显示频道列表（带按钮）\n"
@@ -577,14 +604,19 @@ async def main_async() -> None:
     Path("sessions").mkdir(parents=True, exist_ok=True)
 
     db = Database()
+    try:
+        db.refresh_download_source_last_message_from_groups()
+    except Exception:
+        pass
 
     user_client = TelegramClient("sessions/user_session", int(api_id), str(api_hash), proxy=proxy)
     bot_client = TelegramClient("sessions/manager_bot", int(api_id), str(api_hash), proxy=proxy)
 
     await user_client.connect()
-    if not await user_client.is_user_authorized():
-        await user_client.disconnect()
-        raise RuntimeError("未检测到用户会话，请先运行: python setup_user_session.py")
+    try:
+        user_ready = bool(await user_client.is_user_authorized())
+    except Exception:
+        user_ready = False
 
     await bot_client.start(bot_token=bot_token)
     me = await bot_client.get_me()
@@ -600,7 +632,10 @@ async def main_async() -> None:
     downloader_cfg = load_downloader_config()
     downloader_cfg.download_root_dir.mkdir(parents=True, exist_ok=True)
     runtime = DownloaderRuntime(user_client, downloader_cfg, db)
-    runtime.start()
+    runtime_started = False
+    if user_ready:
+        runtime.start()
+        runtime_started = True
 
     upload_tasks: Dict[int, asyncio.Task] = {}
 
@@ -610,6 +645,254 @@ async def main_async() -> None:
     source_page_size = int(_env_int("BOT_SOURCE_PAGE_SIZE", 8) or 8)
     source_page_size = max(3, min(12, source_page_size))
     source_list_page_by_user: Dict[int, int] = {}
+    user_state_lock = asyncio.Lock()
+    qr_states: Dict[int, QrLoginState] = {}
+    session_offline_notified = False
+
+    def _login_inline_buttons(*, can_refresh: bool = True, allow_switch: bool = False) -> List[List[Button]]:
+        row: List[Button] = [Button.inline("🔳 扫码登录", b"login:qr")]
+        if allow_switch:
+            row.append(Button.inline("🔁 切换账号", b"login:switch"))
+        if can_refresh:
+            row.append(Button.inline("🔄 刷新二维码", b"login:refresh"))
+        return [row, [Button.inline("取消", b"login:cancel")]]
+
+    async def _notify_admins(text: str, buttons: Optional[List[List[Button]]] = None) -> None:
+        for aid in admin_ids:
+            try:
+                await bot_client.send_message(int(aid), text, buttons=buttons)
+            except Exception:
+                pass
+
+    async def _ensure_user_connected() -> None:
+        if not user_client.is_connected():
+            await user_client.connect()
+
+    async def _check_user_ready() -> bool:
+        try:
+            await _ensure_user_connected()
+            return bool(await user_client.is_user_authorized())
+        except Exception:
+            return False
+
+    async def _reset_user_client_for_relogin(reason: str) -> None:
+        nonlocal user_client, runtime, runtime_started, user_ready, session_offline_notified
+        if runtime_started:
+            await runtime.stop()
+            runtime_started = False
+        try:
+            if user_client.is_connected():
+                try:
+                    await user_client.log_out()
+                except Exception:
+                    try:
+                        await user_client.disconnect()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        proxy = build_proxy()
+        user_client = TelegramClient("sessions/user_session", int(api_id), str(api_hash), proxy=proxy)
+        await user_client.connect()
+        user_ready = False
+        session_offline_notified = True
+
+    async def _set_user_ready(ready: bool, *, reason: str, notify: bool = True) -> None:
+        nonlocal user_ready, runtime_started, session_offline_notified, runtime
+        if ready == user_ready:
+            return
+        user_ready = bool(ready)
+        if user_ready:
+            try:
+                if runtime_started and getattr(runtime, "_client", None) is not user_client:
+                    await runtime.stop()
+                    runtime_started = False
+            except Exception:
+                pass
+            if (not runtime_started) or getattr(runtime, "_client", None) is not user_client:
+                runtime = DownloaderRuntime(user_client, downloader_cfg, db)
+                runtime.start()
+                runtime_started = True
+            runtime.refresh_sources_cache(force=True)
+            if notify:
+                await _notify_admins("✅ 用户账号已恢复登录，可以继续监听/克隆。")
+            session_offline_notified = False
+        else:
+            if runtime_started:
+                await runtime.stop()
+                runtime_started = False
+            if notify and not session_offline_notified:
+                await _notify_admins(
+                    "⚠️ 用户账号已掉线/未登录，请在 Bot 中扫码重新登录。",
+                    buttons=_login_inline_buttons(),
+                )
+                session_offline_notified = True
+
+    def _format_qr_caption(state: QrLoginState) -> str:
+        remain = max(0, int(state.expires_at - time.time()))
+        return (
+            "🔳 请使用已登录的 Telegram App 扫码确认登录\n"
+            f"⏳ 二维码剩余时间：{remain} 秒\n"
+            "如已过期请点击“刷新二维码”"
+        )
+
+    def _build_qr_png_bytes(content: str) -> bytes:
+        if qrcode is None:
+            raise RuntimeError("缺少 qrcode 依赖，请先安装 requirements.txt")
+        img = qrcode.make(content)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    async def _cancel_qr_state(admin_id: int) -> None:
+        state = qr_states.pop(int(admin_id), None)
+        if not state:
+            return
+        if state.task and (not state.task.done()):
+            state.task.cancel()
+        state.status = "cancelled"
+
+    async def _start_qr_login(admin_id: int, chat_id: int, *, force: bool = False) -> None:
+        nonlocal session_offline_notified
+        async with user_state_lock:
+            if user_ready and not force:
+                await bot_client.send_message(
+                    int(chat_id),
+                    "当前账号已登录。\n如需切换账号，请点击“切换账号”。",
+                    buttons=_login_inline_buttons(allow_switch=True),
+                )
+                return
+            await _cancel_qr_state(int(admin_id))
+            if force:
+                await _reset_user_client_for_relogin("switch_account")
+            await _ensure_user_connected()
+
+            try:
+                qr = await user_client.qr_login()
+            except Exception as e:
+                await bot_client.send_message(
+                    int(chat_id),
+                    f"❌ 生成登录二维码失败：{e}",
+                    buttons=_reply_menu_keyboard(),
+                )
+                return
+            expires = getattr(qr, "expires", None)
+            if isinstance(expires, datetime):
+                if expires.tzinfo is None:
+                    expires = expires.replace(tzinfo=timezone.utc)
+                expires_ts = float(expires.timestamp())
+            else:
+                expires_ts = float(time.time() + 120)
+
+            state = QrLoginState(
+                admin_id=int(admin_id),
+                chat_id=int(chat_id),
+                qr=qr,
+                qr_url=str(qr.url),
+                expires_at=float(expires_ts),
+                started_at=float(time.time()),
+            )
+            qr_states[int(admin_id)] = state
+
+            try:
+                png_bytes = _build_qr_png_bytes(state.qr_url)
+            except Exception as e:
+                await bot_client.send_message(
+                    int(chat_id),
+                    f"❌ 生成二维码失败：{e}",
+                    buttons=_reply_menu_keyboard(),
+                )
+                qr_states.pop(int(admin_id), None)
+                return
+            qr_buf = io.BytesIO(png_bytes)
+            qr_buf.name = "qr.png"
+            msg = await bot_client.send_file(
+                int(chat_id),
+                file=qr_buf,
+                caption=_format_qr_caption(state),
+                buttons=_login_inline_buttons(allow_switch=user_ready),
+                force_document=False,
+            )
+            state.message_id = int(getattr(msg, "id", 0) or 0) or None
+
+            async def _wait() -> None:
+                try:
+                    await qr.wait()
+                    state.status = "success"
+                    await _set_user_ready(True, reason="qr_login", notify=True)
+                    await bot_client.send_message(
+                        int(chat_id),
+                        "✅ 扫码登录成功，已恢复监听/克隆。",
+                        buttons=_reply_menu_keyboard(),
+                    )
+                    qr_states.pop(int(admin_id), None)
+                except SessionPasswordNeededError:
+                    state.status = "need_password"
+                    pending[int(admin_id)] = PendingTextInput(kind="qr_2fa")
+                    await bot_client.send_message(
+                        int(chat_id),
+                        "🔐 检测到 2FA 密码，请直接发送密码完成登录。",
+                        buttons=_reply_menu_keyboard(),
+                    )
+                except asyncio.TimeoutError:
+                    state.status = "expired"
+                    await bot_client.send_message(
+                        int(chat_id),
+                        "⚠️ 二维码已过期，请点击“刷新二维码”。",
+                        buttons=_login_inline_buttons(allow_switch=user_ready),
+                    )
+                    qr_states.pop(int(admin_id), None)
+                except asyncio.CancelledError:
+                    state.status = "cancelled"
+                except Exception as e:
+                    state.status = "error"
+                    state.error = str(e)
+                    await bot_client.send_message(
+                        int(chat_id),
+                        f"❌ 扫码登录失败：{e}",
+                        buttons=_login_inline_buttons(allow_switch=user_ready),
+                    )
+                    qr_states.pop(int(admin_id), None)
+
+            state.task = asyncio.create_task(_wait())
+            session_offline_notified = False
+
+    async def _notify_need_login(event, *, alert: bool = False) -> None:
+        try:
+            if hasattr(event, "answer"):
+                await event.answer("账号未登录，请先扫码登录", alert=alert)
+        except Exception:
+            pass
+        try:
+            await event.reply(
+                "账号未登录，请先扫码登录。",
+                buttons=_login_inline_buttons(),
+            )
+        except Exception:
+            pass
+
+    async def _session_watchdog() -> None:
+        interval = float(_env_float("BOT_USER_SESSION_CHECK_INTERVAL", 15.0))
+        interval = max(5.0, float(interval))
+        last_state = user_ready
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                ok = await _check_user_ready()
+            except Exception:
+                ok = False
+            if ok != last_state:
+                await _set_user_ready(bool(ok), reason="watchdog", notify=True)
+            last_state = ok
+
+    if not user_ready:
+        await _notify_admins(
+            "⚠️ 未检测到用户会话，请在 Bot 中扫码登录。",
+            buttons=_login_inline_buttons(),
+        )
+        session_offline_notified = True
+
+    watchdog_task = asyncio.create_task(_session_watchdog())
 
     def is_admin(user_id: Optional[int]) -> bool:
         return user_id is not None and int(user_id) in admin_ids
@@ -714,6 +997,7 @@ async def main_async() -> None:
 
         lines: List[str] = [
             "📈 状态",
+            f"- 账号：{'已登录' if user_ready else '未登录'}",
             f"- 来源：{len(sources_all)}（启用 {len(sources_active)}）",
             f"- 超级群组记录：{len(forum_groups)}",
             f"- 已下载媒体组：{total_downloaded}（失败 {total_failed}）",
@@ -759,7 +1043,7 @@ async def main_async() -> None:
             # 更新频道列表
             if list_message_id:
                 try:
-                    list_text, list_buttons = generate_source_list_message(db, runtime)
+                    list_text, list_buttons = generate_source_list_message(db, runtime, user_ready=user_ready)
                     await bot_client.edit_message(int(chat_id), int(list_message_id), list_text, buttons=list_buttons)
                 except Exception:
                     pass
@@ -786,7 +1070,7 @@ async def main_async() -> None:
 
     async def send_source_list(event) -> None:
         source_list_page_by_user[int(event.sender_id or 0)] = 0
-        text, buttons = generate_source_list_message(db, runtime, page=0, page_size=source_page_size)
+        text, buttons = generate_source_list_message(db, runtime, user_ready=user_ready, page=0, page_size=source_page_size)
         try:
             await event.reply(text, buttons=buttons)
         except ReplyMarkupInvalidError:
@@ -825,10 +1109,20 @@ async def main_async() -> None:
             return
         await event.reply(_build_status_text(), buttons=_reply_menu_keyboard())
 
+    @bot_client.on(events.NewMessage(pattern=r"^/login\b"))
+    async def on_login(event):
+        if not is_admin(event.sender_id):
+            await deny(event)
+            return
+        await _start_qr_login(int(event.sender_id), int(event.chat_id))
+
     @bot_client.on(events.NewMessage(pattern=r"^/clone\s+(\d+)(?:\s+(\d+))?"))
     async def on_clone(event):
         if not is_admin(event.sender_id):
             await deny(event)
+            return
+        if not user_ready:
+            await _notify_need_login(event)
             return
         source_id = int(event.pattern_match.group(1))
         start_from_id = None
@@ -852,6 +1146,9 @@ async def main_async() -> None:
     async def on_add_channel(event):
         if not is_admin(event.sender_id):
             await deny(event)
+            return
+        if not user_ready:
+            await _notify_need_login(event)
             return
 
         ref = event.pattern_match.group(1).strip()
@@ -879,6 +1176,9 @@ async def main_async() -> None:
     async def on_add_group(event):
         if not is_admin(event.sender_id):
             await deny(event)
+            return
+        if not user_ready:
+            await _notify_need_login(event)
             return
 
         raw = event.pattern_match.group(1).strip()
@@ -958,6 +1258,23 @@ async def main_async() -> None:
         data = event.data or b""
         user_id = int(event.sender_id)
 
+        if data.startswith(b"login:"):
+            action = data.decode("utf-8", errors="ignore").split(":")[1] if b":" in data else ""
+            if action in {"qr", "refresh"}:
+                await event.answer("正在生成二维码…")
+                await _start_qr_login(int(user_id), int(event.chat_id))
+                return
+            if action == "switch":
+                await event.answer("正在切换账号…")
+                await _start_qr_login(int(user_id), int(event.chat_id), force=True)
+                return
+            if action == "cancel":
+                await _cancel_qr_state(int(user_id))
+                await event.answer("已取消")
+                return
+            await event.answer("无效操作", alert=True)
+            return
+
         if data.startswith(b"src:"):
             parts = data.decode("utf-8", errors="ignore").split(":")
             action = parts[1] if len(parts) > 1 else ""
@@ -969,13 +1286,23 @@ async def main_async() -> None:
                 if page is None:
                     page = _current_page()
                 source_list_page_by_user[user_id] = int(page or 0)
-                text, buttons = generate_source_list_message(db, runtime, page=int(page or 0), page_size=source_page_size)
+                text, buttons = generate_source_list_message(
+                    db,
+                    runtime,
+                    user_ready=user_ready,
+                    page=int(page or 0),
+                    page_size=source_page_size,
+                )
                 try:
                     await event.edit(text, buttons=buttons)
                 except MessageNotModifiedError:
                     return
                 except ReplyMarkupInvalidError:
                     await event.edit(text)
+
+            if (not user_ready) and action not in {"refresh", "page", "noop", "close"}:
+                await _notify_need_login(event, alert=True)
+                return
 
             if action == "refresh":
                 page = _current_page()
@@ -1260,6 +1587,10 @@ async def main_async() -> None:
                 except MessageNotModifiedError:
                     return
 
+            if (not user_ready) and action not in {"refresh"}:
+                await _notify_need_login(event, alert=True)
+                return
+
             if action == "refresh":
                 await _grefresh()
                 return
@@ -1452,6 +1783,10 @@ async def main_async() -> None:
             pending.pop(user_id, None)
             await event.reply(_build_status_text(), buttons=_reply_menu_keyboard())
             return
+        if text == "账号登录":
+            pending.pop(user_id, None)
+            await _start_qr_login(int(user_id), int(event.chat_id))
+            return
         if text == "添加频道":
             pending[user_id] = PendingTextInput(kind="addchannel")
             await event.reply("请发送频道引用（用户名/链接/ID），例如：@example_channel 或 -1001234567890", buttons=_reply_menu_keyboard())
@@ -1471,6 +1806,26 @@ async def main_async() -> None:
 
         if isinstance(state, PendingTextInput):
             try:
+                if state.kind == "qr_2fa":
+                    password = (text or "").strip()
+                    if not password:
+                        await event.reply("2FA 密码不能为空，请重新发送。", buttons=_reply_menu_keyboard())
+                        return
+                    try:
+                        await user_client.sign_in(password=password)
+                        pending.pop(user_id, None)
+                        qr_states.pop(int(user_id), None)
+                        await _set_user_ready(True, reason="qr_2fa", notify=True)
+                        await event.reply("✅ 2FA 登录成功，已恢复监听/克隆。", buttons=_reply_menu_keyboard())
+                    except Exception as e:
+                        await event.reply(f"❌ 2FA 登录失败：{e}\n请重新发送密码或重新扫码。", buttons=_reply_menu_keyboard())
+                    return
+
+                if not user_ready:
+                    pending.pop(user_id, None)
+                    await _notify_need_login(event)
+                    return
+
                 if state.kind == "addchannel":
                     entity = await _resolve_entity(user_client, _parse_entity_ref(text))
                     title = getattr(entity, "title", None) or getattr(entity, "first_name", None) or text
@@ -1705,6 +2060,18 @@ async def main_async() -> None:
         await bot_client.run_until_disconnected()
     finally:
         pending.clear()
+        for st in list(qr_states.values()):
+            try:
+                if st.task and (not st.task.done()):
+                    st.task.cancel()
+            except Exception:
+                pass
+        qr_states.clear()
+        try:
+            watchdog_task.cancel()
+            await watchdog_task
+        except Exception:
+            pass
         await runtime.stop()
         await bot_client.disconnect()
         await user_client.disconnect()

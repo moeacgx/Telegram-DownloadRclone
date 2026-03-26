@@ -3,7 +3,7 @@
 本项目用于：
 - 以 **用户账号（Telethon）** 读取频道/超级群 Forum 话题中的消息
 - **仅下载媒体**（包含相册/媒体组 `grouped_id`）到本地目录
-- 按 **媒体组** 记录下载完成与进度（最后消息 ID）
+- 按 **媒体组** 记录下载完成与进度（最后消息 ID，重启可继续）
 - 可选：下载完成后使用 `rclone copy` 上传到远端（如 PikPak），**上传成功后自动删除本地组目录**
 
 > 本版本已移除：转发/推送到目标群、任何中转频道逻辑、标题润色/AI 相关能力。
@@ -19,13 +19,15 @@
 
 1) 准备 `.env`（参考 `.env.example`），并确保 `sessions/` 会持久化（挂载卷）。
 
-2) 首次生成用户会话（需要交互输入验证码/2FA）：
+2) 首次生成用户会话（推荐在 Bot 内扫码登录；也可用验证码/2FA 登录）：
 
 ```bash
 docker compose --profile tools run --rm tg-login
 ```
 
 会生成 `sessions/user_session.session`。
+
+也可以先启动管理 Bot，然后在 Telegram 里对 Bot 执行“账号登录”扫码完成登录。
 
 3) 启动管理 Bot（会同时跑下载监听/克隆）：
 
@@ -85,14 +87,18 @@ docker compose logs -f tg-manager
 
 ## 配置
 
-1) 复制 `.env.example` 为 `.env` 并填写 `API_ID` / `API_HASH` / `USER_PHONE` / `BOT_TOKEN` / `ADMIN_USER_IDS`。
+1) 复制 `.env.example` 为 `.env` 并填写 `API_ID` / `API_HASH` / `BOT_TOKEN` / `ADMIN_USER_IDS`。
+   （`USER_PHONE` 为可选，仅用于命令行登录脚本）
 
 常用参数说明（都在 `.env.example` 里）：  
 - `MEDIA_GROUP_FLUSH_SECONDS`：相册（`grouped_id`）聚合等待时间  
 - `MAX_DOWNLOAD_CONCURRENCY`：同时下载的媒体消息数量（消息级并发；相册/单条媒体都按“消息数”计）
 - `MAX_GROUP_CONCURRENCY`：同时处理的媒体组数量（组级并发；控制同时创建多少组目录/同时跑多少组任务）
 
-2) 首次登录生成会话：
+2) 首次登录生成会话（推荐 Bot 扫码登录）：
+
+- 方式 A（推荐）：启动管理 Bot，在 Telegram 中选择“账号登录”扫码完成
+- 方式 B（可选）：命令行登录脚本
 
 ```bash
 python setup_user_session.py
@@ -121,6 +127,7 @@ python manager_bot.py
 - “频道列表”默认按新增顺序倒序展示（最新在前），方便对新添加来源立即操作
 
 提示：运行 `python manager_bot.py` 会同时启动下载监听；来源“开始监听”后会自动下载新媒体。
+若用户账号掉线，管理 Bot 会提示重新扫码登录。
 
 ### 方式 B：命令行工具
 

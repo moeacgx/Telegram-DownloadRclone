@@ -70,6 +70,8 @@ python-dotenv==1.0.1
     # via -r requirements.in
 python-socks[asyncio]==2.8.0
     # via -r requirements.in
+qrcode==7.4.2
+    # via -r requirements.in
 requests==2.31.0
     # via -r requirements.in
 rsa==4.9

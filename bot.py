@@ -2079,6 +2079,10 @@ async def run_downloader(backfill: bool) -> None:
     cfg.download_root_dir.mkdir(parents=True, exist_ok=True)
 
     db = Database()
+    try:
+        db.refresh_download_source_last_message_from_groups()
+    except Exception:
+        pass
 
     supervise_reconnect = _env_bool("TG_SUPERVISE_RECONNECT", True)
     reconnect_delay = float(_env_float("TG_RECONNECT_DELAY_INITIAL_SECONDS", 2.0))
