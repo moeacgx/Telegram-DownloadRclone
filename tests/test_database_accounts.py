@@ -83,6 +83,30 @@ class TestDatabaseTelegramAccounts(unittest.TestCase):
         self.assertIsNone(self.db.get_tg_account(account_id))
         self.assertFalse(self.db.delete_tg_account(account_id))
 
+    def test_set_all_download_sources_active(self) -> None:
+        first_id = self.db.add_download_source(
+            source_type="channel",
+            chat_id=-10010001,
+            display_title="来源A",
+            is_active=False,
+        )
+        second_id = self.db.add_download_source(
+            source_type="channel",
+            chat_id=-10010002,
+            display_title="来源B",
+            is_active=True,
+        )
+
+        changed = self.db.set_all_download_sources_active(True)
+        self.assertEqual(changed, 2)
+        self.assertTrue(self.db.get_download_source(first_id)["is_active"])
+        self.assertTrue(self.db.get_download_source(second_id)["is_active"])
+
+        changed = self.db.set_all_download_sources_active(False)
+        self.assertEqual(changed, 2)
+        self.assertFalse(self.db.get_download_source(first_id)["is_active"])
+        self.assertFalse(self.db.get_download_source(second_id)["is_active"])
+
 
 if __name__ == "__main__":
     unittest.main()

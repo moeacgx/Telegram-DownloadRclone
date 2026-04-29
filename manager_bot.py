@@ -342,8 +342,11 @@ def generate_source_list_message(
 
     text_lines: List[str] = [f"📋 频道/话题列表（{page + 1}/{pages}）\n"]
     if not user_ready:
-        text_lines.append("⚠️ 账号未登录，列表仅展示，操作将被禁用。\n")
+        text_lines.append("⚠️ 账号未登录，克隆/补克隆等需要 Telegram 会话的操作将被禁用；监听开关仍可调整。\n")
     buttons: List[List[Button]] = []
+    active_count = sum(1 for item in sources if bool(item.get("is_active")))
+    paused_count = max(0, len(sources) - active_count)
+    text_lines.append(f"✅ 监听中：{active_count}  |  ⏸️ 已暂停：{paused_count}\n")
 
     for source in sources_page:
         source_id = int(source["id"])
@@ -394,6 +397,12 @@ def generate_source_list_message(
     if nav:
         buttons.append(nav)
 
+    buttons.append(
+        [
+            Button.inline("✅ 开启全部监听", b"src:allon"),
+            Button.inline("⏸️ 全部暂停监听", b"src:alloff"),
+        ]
+    )
     buttons.append([Button.inline("🔄 刷新列表", f"src:refresh:{page}".encode("utf-8"))])
     return "\n".join(text_lines).strip(), buttons
 
@@ -561,7 +570,7 @@ def _help_text() -> str:
         "管理方式：\n"
         "- 推荐：使用输入框下方的菜单键盘（/start 或 /menu）\n"
         "- 账号管理：菜单中选择“账号管理”，支持扫码登录、手机号验证码登录、切换账号\n"
-        "- 频道列表里可：暂停/恢复监听、点击“克隆”（历史下载），克隆完成自动切换监听\n"
+        "- 频道列表里可：暂停/恢复监听、一键开启全部监听、点击“克隆”（历史下载），克隆完成自动切换监听\n"
         "- 超级群组列表：保存群组快捷记录，一键重新拉取话题并选择加入工作列表\n"
         "- 兼容：仍支持文本命令（不推荐）\n"
         "\n"
@@ -1438,8 +1447,6 @@ async def main_async() -> None:
             await event.reply("该来源正在克隆中", buttons=_reply_menu_keyboard())
             return
         title = str(source.get("display_title") or f"source_{source_id}")
-        db.set_download_source_active(source_id, False)
-        runtime.refresh_sources_cache(force=True)
         task = runtime.start_clone(source_id, auto_listen=True, start_from_message_id=start_from_id)
         asyncio.create_task(_run_clone_with_progress(int(event.chat_id), source_id, title, task))
 
@@ -1721,7 +1728,7 @@ async def main_async() -> None:
                 except ReplyMarkupInvalidError:
                     await event.edit(text)
 
-            if (not user_ready) and action not in {"refresh", "page", "noop", "close"}:
+            if (not user_ready) and action not in {"refresh", "page", "noop", "close", "toggle", "allon", "alloff"}:
                 await _notify_need_login(event, alert=True)
                 return
 
@@ -1741,6 +1748,20 @@ async def main_async() -> None:
 
             if action == "noop":
                 await event.answer("请选择下方操作按钮")
+                return
+
+            if action == "allon":
+                changed = db.set_all_download_sources_active(True)
+                runtime.refresh_sources_cache(force=True)
+                await event.answer(f"已开启全部监听（{changed} 个来源）")
+                await _refresh()
+                return
+
+            if action == "alloff":
+                changed = db.set_all_download_sources_active(False)
+                runtime.refresh_sources_cache(force=True)
+                await event.answer(f"已暂停全部监听（{changed} 个来源）")
+                await _refresh()
                 return
 
             if len(parts) < 3 or not parts[2].isdigit():
@@ -1818,8 +1839,6 @@ async def main_async() -> None:
                     return
                 title = str(source.get("display_title") or f"source_{source_id}")
                 await event.answer("开始克隆…")
-                db.set_download_source_active(source_id, False)
-                runtime.refresh_sources_cache(force=True)
                 task = runtime.start_clone(source_id, auto_listen=True)
                 asyncio.create_task(
                     _run_clone_with_progress(
@@ -1838,8 +1857,6 @@ async def main_async() -> None:
                     await event.answer("当前未在克隆")
                     return
                 ok = runtime.stop_clone(source_id)
-                db.set_download_source_active(source_id, True)
-                runtime.refresh_sources_cache(force=True)
                 await event.answer("已停止" if ok else "停止失败")
                 await _refresh()
                 return
@@ -1942,8 +1959,6 @@ async def main_async() -> None:
                     return
                 title = str(source.get("display_title") or f"source_{source_id}")
                 await event.answer("从头克隆…")
-                db.set_download_source_active(source_id, False)
-                runtime.refresh_sources_cache(force=True)
                 task = runtime.start_clone(source_id, auto_listen=True, start_from_message_id=1)
                 asyncio.create_task(
                     _run_clone_with_progress(
@@ -2402,8 +2417,6 @@ async def main_async() -> None:
                             )
                         except Exception:
                             pass
-                    db.set_download_source_active(src_id, False)
-                    runtime.refresh_sources_cache(force=True)
                     task = runtime.start_clone(src_id, auto_listen=True, start_from_message_id=msg_id)
                     title = str(source.get("display_title") or f"source_{src_id}")
                     asyncio.create_task(_run_clone_with_progress(int(event.chat_id), src_id, title, task))

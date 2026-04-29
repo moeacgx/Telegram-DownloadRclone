@@ -1932,9 +1932,9 @@ class DownloaderRuntime:
             start_from_message_id=int(start_from_message_id or init_msg_id),
         )
 
-        # 克隆期间：来源置为 inactive；新消息仍会被捕获，但媒体组会排队到克隆完成后再处理，避免并发重复下载
-        self._db.set_download_source_active(source_id, False)
-        self.refresh_sources_cache(force=True)
+        # 克隆期间不再修改来源的持久化监听开关。
+        # 这样即使容器重启或进程异常退出，也不会把“应当监听”的来源永久写成暂停。
+        # 新消息仍会被捕获，但媒体组会排队到克隆完成后再处理，避免并发重复下载。
         ok = False
         attempts = max(1, int(_clone_retry_attempts()))
         last_err: Optional[Exception] = None

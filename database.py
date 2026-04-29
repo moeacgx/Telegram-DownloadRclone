@@ -544,6 +544,18 @@ class Database:
         self.conn.commit()
         return cursor.rowcount > 0
 
+    def set_all_download_sources_active(self, is_active: bool) -> int:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            UPDATE download_sources
+            SET is_active=?, updated_at=CURRENT_TIMESTAMP
+            """,
+            (1 if is_active else 0,),
+        )
+        self.conn.commit()
+        return int(cursor.rowcount or 0)
+
     def update_download_source_last_message(self, source_id: int, last_message_id: int) -> bool:
         cursor = self.conn.cursor()
         cursor.execute(
