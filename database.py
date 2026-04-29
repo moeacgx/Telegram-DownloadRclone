@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""SQLite 数据库（仅用于“来源管理 + 媒体组下载进度”）
+"""SQLite 数据库（用于“来源管理 + 媒体组下载进度 + Telegram 账号管理”）
 
 本项目已移除旧的“推送/中转/标题润色”等逻辑，这里只保留：
 - download_sources：下载来源（频道 / 超级群 Forum 话题）
 - download_counters：同一来源同一日期的序号（001/002/...）
 - download_groups：媒体组下载/上传状态（去重、进度、失败原因）
+- tg_accounts：Telegram 账号信息与单活跃状态
 """
 
 from __future__ import annotations
@@ -115,9 +116,30 @@ class Database:
             """
         )
 
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tg_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                label TEXT,
+                phone TEXT,
+                username TEXT,
+                user_id INTEGER,
+                session_name TEXT NOT NULL UNIQUE,
+                is_active BOOLEAN DEFAULT 0,
+                status TEXT DEFAULT 'new',
+                status_message TEXT,
+                last_login_at TIMESTAMP,
+                last_logout_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_download_sources_active ON download_sources(is_active)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_download_groups_source_id ON download_groups(source_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_download_groups_status ON download_groups(status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tg_accounts_active ON tg_accounts(is_active)")
 
         # 兜底：将历史 download_sources.topic_root_message_id 的 NULL 归一化为 0
         try:
@@ -148,6 +170,227 @@ class Database:
             pass
 
         self.conn.commit()
+
+    def _row_to_tg_account_dict(self, row: sqlite3.Row) -> dict:
+        return {
+            "id": int(row["id"]),
+            "label": row["label"],
+            "phone": row["phone"],
+            "username": row["username"],
+            "user_id": row["user_id"],
+            "session_name": str(row["session_name"]),
+            "is_active": bool(row["is_active"]),
+            "status": str(row["status"] or "new"),
+            "status_message": row["status_message"],
+            "last_login_at": row["last_login_at"],
+            "last_logout_at": row["last_logout_at"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def create_tg_account(
+        self,
+        session_name: str,
+        label: Optional[str] = None,
+        phone: Optional[str] = None,
+        username: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_active: bool = False,
+        status: str = "new",
+        status_message: Optional[str] = None,
+        last_login_at=None,
+        last_logout_at=None,
+    ) -> int:
+        cursor = self.conn.cursor()
+
+        if is_active:
+            cursor.execute("UPDATE tg_accounts SET is_active=0, updated_at=CURRENT_TIMESTAMP WHERE is_active=1")
+
+        cursor.execute(
+            """
+            INSERT INTO tg_accounts (
+                label, phone, username, user_id, session_name,
+                is_active, status, status_message, last_login_at, last_logout_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                label,
+                phone,
+                username,
+                user_id,
+                str(session_name),
+                1 if is_active else 0,
+                str(status),
+                status_message,
+                last_login_at,
+                last_logout_at,
+            ),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid)
+
+    def get_tg_account(self, account_id: int) -> Optional[dict]:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                id, label, phone, username, user_id, session_name,
+                is_active, status, status_message, last_login_at,
+                last_logout_at, created_at, updated_at
+            FROM tg_accounts
+            WHERE id=?
+            LIMIT 1
+            """,
+            (int(account_id),),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return self._row_to_tg_account_dict(row)
+
+    def get_tg_account_by_session_name(self, session_name: str) -> Optional[dict]:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                id, label, phone, username, user_id, session_name,
+                is_active, status, status_message, last_login_at,
+                last_logout_at, created_at, updated_at
+            FROM tg_accounts
+            WHERE session_name=?
+            LIMIT 1
+            """,
+            (str(session_name),),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return self._row_to_tg_account_dict(row)
+
+    def list_tg_accounts(self) -> list[dict]:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                id, label, phone, username, user_id, session_name,
+                is_active, status, status_message, last_login_at,
+                last_logout_at, created_at, updated_at
+            FROM tg_accounts
+            ORDER BY is_active DESC, id DESC
+            """
+        )
+        return [self._row_to_tg_account_dict(row) for row in cursor.fetchall()]
+
+    def update_tg_account(self, account_id: int, **fields) -> bool:
+        allowed_fields = {
+            "label",
+            "phone",
+            "username",
+            "user_id",
+            "session_name",
+            "is_active",
+            "status",
+            "status_message",
+            "last_login_at",
+            "last_logout_at",
+        }
+        unknown_fields = set(fields) - allowed_fields
+        if unknown_fields:
+            raise ValueError(f"不支持更新的账号字段: {', '.join(sorted(unknown_fields))}")
+
+        if not fields:
+            return self.get_tg_account(account_id) is not None
+
+        if "is_active" in fields and fields["is_active"]:
+            remaining_fields = {k: v for k, v in fields.items() if k != "is_active"}
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT id FROM tg_accounts WHERE id=? LIMIT 1", (int(account_id),))
+            if not cursor.fetchone():
+                return False
+            cursor.execute("UPDATE tg_accounts SET is_active=0, updated_at=CURRENT_TIMESTAMP WHERE is_active=1")
+
+            updates = ["is_active=1", "updated_at=CURRENT_TIMESTAMP"]
+            values = []
+            for key, value in remaining_fields.items():
+                updates.append(f"{key}=?")
+                values.append(value)
+            values.append(int(account_id))
+            cursor.execute(
+                f"""
+                UPDATE tg_accounts
+                SET {", ".join(updates)}
+                WHERE id=?
+                """,
+                tuple(values),
+            )
+            self.conn.commit()
+            return cursor.rowcount > 0
+
+        updates = []
+        values = []
+        for key, value in fields.items():
+            updates.append(f"{key}=?")
+            if key == "is_active":
+                values.append(1 if value else 0)
+            else:
+                values.append(value)
+
+        values.append(int(account_id))
+        cursor = self.conn.cursor()
+        cursor.execute(
+            f"""
+            UPDATE tg_accounts
+            SET {", ".join(updates)}, updated_at=CURRENT_TIMESTAMP
+            WHERE id=?
+            """,
+            tuple(values),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def set_active_tg_account(self, account_id: int) -> bool:
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT id FROM tg_accounts WHERE id=? LIMIT 1", (int(account_id),))
+        if not cursor.fetchone():
+            return False
+
+        cursor.execute("UPDATE tg_accounts SET is_active=0, updated_at=CURRENT_TIMESTAMP WHERE is_active=1")
+        cursor.execute(
+            """
+            UPDATE tg_accounts
+            SET is_active=1, updated_at=CURRENT_TIMESTAMP
+            WHERE id=?
+            """,
+            (int(account_id),),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def get_active_tg_account(self) -> Optional[dict]:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                id, label, phone, username, user_id, session_name,
+                is_active, status, status_message, last_login_at,
+                last_logout_at, created_at, updated_at
+            FROM tg_accounts
+            WHERE is_active=1
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return self._row_to_tg_account_dict(row)
+
+    def delete_tg_account(self, account_id: int) -> bool:
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM tg_accounts WHERE id=?", (int(account_id),))
+        self.conn.commit()
+        return cursor.rowcount > 0
 
     # -------------------------
     # Forum groups

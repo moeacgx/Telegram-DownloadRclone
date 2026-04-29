@@ -236,7 +236,7 @@ def _reply_menu_keyboard() -> List[List[Button]]:
     return [
         [Button.text("添加频道", **kw), Button.text("添加群话题", **kw)],
         [Button.text("频道列表", **kw), Button.text("超级群组列表", **kw)],
-        [Button.text("账号登录", **kw), Button.text("状态", **kw)],
+        [Button.text("账号管理", **kw), Button.text("状态", **kw)],
         [Button.text("帮助", **kw), Button.text("菜单", **kw)],
     ]
 
@@ -560,13 +560,13 @@ def _help_text() -> str:
     return (
         "管理方式：\n"
         "- 推荐：使用输入框下方的菜单键盘（/start 或 /menu）\n"
-        "- 账号登录：菜单中选择“账号登录”，或使用 /login 生成二维码\n"
+        "- 账号管理：菜单中选择“账号管理”，支持扫码登录、手机号验证码登录、切换账号\n"
         "- 频道列表里可：暂停/恢复监听、点击“克隆”（历史下载），克隆完成自动切换监听\n"
         "- 超级群组列表：保存群组快捷记录，一键重新拉取话题并选择加入工作列表\n"
         "- 兼容：仍支持文本命令（不推荐）\n"
         "\n"
         "文本命令：\n"
-        "/login   # 生成扫码登录二维码\n"
+        "/login   # 对当前激活账号生成扫码登录二维码\n"
         "/addchannel <频道用户名/链接/ID>\n"
         "/addgroup <群组用户名/链接/ID> [可选关键词过滤]\n"
         "/sources  # 显示频道列表（带按钮）\n"
@@ -609,7 +609,86 @@ async def main_async() -> None:
     except Exception:
         pass
 
-    user_client = TelegramClient("sessions/user_session", int(api_id), str(api_hash), proxy=proxy)
+    def _now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _is_placeholder_account_label(label: Optional[str]) -> bool:
+        text = (label or "").strip()
+        if not text:
+            return True
+        return text in {"迁移账号", "默认账号"} or text.startswith("新账号")
+
+    def _build_account_label(*, label: Optional[str], phone: Optional[str], username: Optional[str], user_id: Optional[int]) -> str:
+        custom = (label or "").strip()
+        if custom and not _is_placeholder_account_label(custom):
+            return custom
+        if phone:
+            phone_text = str(phone).strip()
+            if phone_text:
+                return phone_text if phone_text.startswith("+") else f"+{phone_text}"
+        if username:
+            return f"@{username}"
+        if user_id:
+            return f"user_{int(user_id)}"
+        return custom or "未命名账号"
+
+    def _build_display_name_from_me(me: Any) -> str:
+        first = str(getattr(me, "first_name", "") or "").strip()
+        last = str(getattr(me, "last_name", "") or "").strip()
+        full = " ".join(part for part in [first, last] if part).strip()
+        if full:
+            return full
+        username = str(getattr(me, "username", "") or "").strip()
+        if username:
+            return f"@{username}"
+        phone = str(getattr(me, "phone", "") or "").strip()
+        if phone:
+            return phone if phone.startswith("+") else f"+{phone}"
+        user_id = int(getattr(me, "id", 0) or 0)
+        return f"user_{user_id}" if user_id > 0 else "未命名账号"
+
+    def _session_base_path(session_name: str) -> str:
+        return str((Path("sessions") / str(session_name)).as_posix())
+
+    def _session_file_path(session_name: str) -> Path:
+        return Path("sessions") / f"{str(session_name)}.session"
+
+    def _build_user_client_for_account(account: dict) -> TelegramClient:
+        session_name = str(account.get("session_name") or "user_session")
+        return TelegramClient(_session_base_path(session_name), int(api_id), str(api_hash), proxy=build_proxy())
+
+    def _bootstrap_accounts() -> dict:
+        accounts = db.list_tg_accounts()
+        if not accounts:
+            has_legacy_session = _session_file_path("user_session").exists()
+            account_id = db.create_tg_account(
+                label="迁移账号" if has_legacy_session else "默认账号",
+                session_name="user_session",
+                is_active=True,
+                status="new",
+                status_message="等待登录",
+            )
+            account = db.get_tg_account(account_id)
+            if account:
+                return account
+
+        active = db.get_active_tg_account()
+        if active:
+            return active
+
+        accounts = db.list_tg_accounts()
+        if accounts:
+            first = accounts[0]
+            db.set_active_tg_account(int(first["id"]))
+            active = db.get_active_tg_account()
+            if active:
+                return active
+            return first
+
+        raise RuntimeError("初始化账号失败：未能创建默认账号")
+
+    active_account = _bootstrap_accounts()
+    user_client = _build_user_client_for_account(active_account)
     bot_client = TelegramClient("sessions/manager_bot", int(api_id), str(api_hash), proxy=proxy)
 
     await user_client.connect()
@@ -617,6 +696,34 @@ async def main_async() -> None:
         user_ready = bool(await user_client.is_user_authorized())
     except Exception:
         user_ready = False
+
+    if user_ready:
+        try:
+            me = await user_client.get_me()
+            current = db.get_tg_account(int(active_account["id"])) or active_account
+            db.update_tg_account(
+                int(active_account["id"]),
+                label=_build_account_label(
+                    label=_build_display_name_from_me(me) if _is_placeholder_account_label(current.get("label")) else current.get("label"),
+                    phone=str(getattr(me, "phone", "") or "").strip() or current.get("phone"),
+                    username=str(getattr(me, "username", "") or "").strip() or current.get("username"),
+                    user_id=int(getattr(me, "id", 0) or 0) or current.get("user_id"),
+                ),
+                phone=str(getattr(me, "phone", "") or "").strip() or current.get("phone"),
+                username=str(getattr(me, "username", "") or "").strip() or current.get("username"),
+                user_id=int(getattr(me, "id", 0) or 0) or current.get("user_id"),
+                status="ready",
+                status_message=None,
+            )
+            active_account = db.get_tg_account(int(active_account["id"])) or active_account
+        except Exception:
+            pass
+    else:
+        try:
+            db.update_tg_account(int(active_account["id"]), status="offline", status_message="未登录")
+            active_account = db.get_tg_account(int(active_account["id"])) or active_account
+        except Exception:
+            pass
 
     await bot_client.start(bot_token=bot_token)
     me = await bot_client.get_me()
@@ -649,13 +756,119 @@ async def main_async() -> None:
     qr_states: Dict[int, QrLoginState] = {}
     session_offline_notified = False
 
-    def _login_inline_buttons(*, can_refresh: bool = True, allow_switch: bool = False) -> List[List[Button]]:
-        row: List[Button] = [Button.inline("🔳 扫码登录", b"login:qr")]
-        if allow_switch:
-            row.append(Button.inline("🔁 切换账号", b"login:switch"))
+    def _current_account_name() -> str:
+        return _build_account_label(
+            label=active_account.get("label") if active_account else None,
+            phone=active_account.get("phone") if active_account else None,
+            username=active_account.get("username") if active_account else None,
+            user_id=int(active_account.get("user_id") or 0) if active_account else None,
+        )
+
+    async def _refresh_active_account_from_db() -> None:
+        nonlocal active_account
+        if not active_account:
+            return
+        latest = db.get_tg_account(int(active_account["id"]))
+        if latest:
+            active_account = latest
+
+    async def _sync_active_account_profile(*, mark_login: bool = False) -> Optional[dict]:
+        nonlocal active_account
+        if not active_account:
+            return None
+        account_id = int(active_account["id"])
+        try:
+            await _ensure_user_connected()
+            if not await user_client.is_user_authorized():
+                payload = {
+                    "status": "offline",
+                    "status_message": "未登录",
+                }
+                if mark_login:
+                    payload["last_logout_at"] = _now_iso()
+                db.update_tg_account(account_id, **payload)
+                active_account = db.get_tg_account(account_id) or active_account
+                return None
+            me = await user_client.get_me()
+            current = db.get_tg_account(account_id) or active_account
+            display_name = _build_display_name_from_me(me)
+            fields = {
+                "phone": str(getattr(me, "phone", "") or "").strip() or current.get("phone"),
+                "username": str(getattr(me, "username", "") or "").strip() or current.get("username"),
+                "user_id": int(getattr(me, "id", 0) or 0) or current.get("user_id"),
+                "status": "ready",
+                "status_message": None,
+            }
+            if _is_placeholder_account_label(current.get("label")):
+                fields["label"] = display_name
+            if mark_login:
+                fields["last_login_at"] = _now_iso()
+            db.update_tg_account(account_id, **fields)
+            active_account = db.get_tg_account(account_id) or active_account
+            return active_account
+        except Exception as e:
+            db.update_tg_account(account_id, status="error", status_message=str(e))
+            active_account = db.get_tg_account(account_id) or active_account
+            return None
+
+    async def _disconnect_user_client() -> None:
+        try:
+            if user_client.is_connected():
+                await user_client.disconnect()
+        except Exception:
+            pass
+
+    async def _replace_user_client_for_account(account: dict) -> None:
+        nonlocal user_client, active_account
+        await _disconnect_user_client()
+        db.set_active_tg_account(int(account["id"]))
+        active_account = db.get_active_tg_account() or account
+        user_client = _build_user_client_for_account(active_account)
+        await user_client.connect()
+
+    async def _switch_active_account(account_id: int) -> bool:
+        nonlocal session_offline_notified
+        target = db.get_tg_account(int(account_id))
+        if not target:
+            raise RuntimeError("账号不存在")
+
+        async with user_state_lock:
+            await _replace_user_client_for_account(target)
+            ok = await _check_user_ready()
+            if ok:
+                await _sync_active_account_profile(mark_login=False)
+            else:
+                db.update_tg_account(int(target["id"]), status="offline", status_message="未登录")
+                await _refresh_active_account_from_db()
+            session_offline_notified = False
+            await _set_user_ready(bool(ok), reason="switch_account", notify=False, force_refresh=True)
+            return bool(ok)
+
+    async def _delete_account_session_files(session_name: str) -> None:
+        base = Path("sessions") / str(session_name)
+        candidates = [
+            base.with_suffix(".session"),
+            base.with_name(base.name + ".session-journal"),
+        ]
+        for path in candidates:
+            try:
+                if path.exists():
+                    path.unlink()
+            except Exception:
+                pass
+
+    def _login_inline_buttons(*, can_refresh: bool = True, show_account_menu: bool = True) -> List[List[Button]]:
+        row: List[Button] = [
+            Button.inline("🔳 扫码登录", b"login:qr"),
+            Button.inline("📱 手机号登录", b"login:phone"),
+        ]
         if can_refresh:
             row.append(Button.inline("🔄 刷新二维码", b"login:refresh"))
-        return [row, [Button.inline("取消", b"login:cancel")]]
+        tail: List[Button] = []
+        if show_account_menu:
+            tail.append(Button.inline("👤 账号管理", b"acct:menu"))
+        tail.append(Button.inline("取消", b"login:cancel"))
+        return [row, tail]
 
     async def _notify_admins(text: str, buttons: Optional[List[List[Button]]] = None) -> None:
         for aid in admin_ids:
@@ -675,31 +888,10 @@ async def main_async() -> None:
         except Exception:
             return False
 
-    async def _reset_user_client_for_relogin(reason: str) -> None:
-        nonlocal user_client, runtime, runtime_started, user_ready, session_offline_notified
-        if runtime_started:
-            await runtime.stop()
-            runtime_started = False
-        try:
-            if user_client.is_connected():
-                try:
-                    await user_client.log_out()
-                except Exception:
-                    try:
-                        await user_client.disconnect()
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        proxy = build_proxy()
-        user_client = TelegramClient("sessions/user_session", int(api_id), str(api_hash), proxy=proxy)
-        await user_client.connect()
-        user_ready = False
-        session_offline_notified = True
-
-    async def _set_user_ready(ready: bool, *, reason: str, notify: bool = True) -> None:
+    async def _set_user_ready(ready: bool, *, reason: str, notify: bool = True, force_refresh: bool = False) -> None:
         nonlocal user_ready, runtime_started, session_offline_notified, runtime
-        if ready == user_ready:
+        state_changed = bool(ready) != bool(user_ready)
+        if (not force_refresh) and (not state_changed):
             return
         user_ready = bool(ready)
         if user_ready:
@@ -714,24 +906,31 @@ async def main_async() -> None:
                 runtime.start()
                 runtime_started = True
             runtime.refresh_sources_cache(force=True)
-            if notify:
-                await _notify_admins("✅ 用户账号已恢复登录，可以继续监听/克隆。")
+            if active_account:
+                db.update_tg_account(int(active_account["id"]), status="ready", status_message=None)
+                await _refresh_active_account_from_db()
+            if notify and (state_changed or force_refresh):
+                await _notify_admins(f"✅ 当前账号已恢复登录：{_current_account_name()}，可以继续监听/克隆。")
             session_offline_notified = False
         else:
             if runtime_started:
                 await runtime.stop()
                 runtime_started = False
-            if notify and not session_offline_notified:
+            if active_account:
+                db.update_tg_account(int(active_account["id"]), status="offline", status_message="未登录")
+                await _refresh_active_account_from_db()
+            if notify and ((not session_offline_notified) or force_refresh):
                 await _notify_admins(
-                    "⚠️ 用户账号已掉线/未登录，请在 Bot 中扫码重新登录。",
-                    buttons=_login_inline_buttons(),
+                    f"⚠️ 当前账号已掉线/未登录：{_current_account_name()}。\n请使用扫码登录或手机号验证码登录恢复。",
+                    buttons=_login_inline_buttons(can_refresh=False),
                 )
                 session_offline_notified = True
 
     def _format_qr_caption(state: QrLoginState) -> str:
         remain = max(0, int(state.expires_at - time.time()))
         return (
-            "🔳 请使用已登录的 Telegram App 扫码确认登录\n"
+            f"🔳 当前账号：{_current_account_name()}\n"
+            "请使用已登录的 Telegram App 扫码确认登录\n"
             f"⏳ 二维码剩余时间：{remain} 秒\n"
             "如已过期请点击“刷新二维码”"
         )
@@ -758,13 +957,11 @@ async def main_async() -> None:
             if user_ready and not force:
                 await bot_client.send_message(
                     int(chat_id),
-                    "当前账号已登录。\n如需切换账号，请点击“切换账号”。",
-                    buttons=_login_inline_buttons(allow_switch=True),
+                    "当前激活账号已登录。\n如需登录其他账号，请先进入“账号管理”中新建或切换账号。",
+                    buttons=[[Button.inline("👤 打开账号管理", b"acct:menu")]],
                 )
                 return
             await _cancel_qr_state(int(admin_id))
-            if force:
-                await _reset_user_client_for_relogin("switch_account")
             await _ensure_user_connected()
 
             try:
@@ -810,7 +1007,7 @@ async def main_async() -> None:
                 int(chat_id),
                 file=qr_buf,
                 caption=_format_qr_caption(state),
-                buttons=_login_inline_buttons(allow_switch=user_ready),
+                buttons=_login_inline_buttons(),
                 force_document=False,
             )
             state.message_id = int(getattr(msg, "id", 0) or 0) or None
@@ -819,10 +1016,11 @@ async def main_async() -> None:
                 try:
                     await qr.wait()
                     state.status = "success"
-                    await _set_user_ready(True, reason="qr_login", notify=True)
+                    await _sync_active_account_profile(mark_login=True)
+                    await _set_user_ready(True, reason="qr_login", notify=True, force_refresh=True)
                     await bot_client.send_message(
                         int(chat_id),
-                        "✅ 扫码登录成功，已恢复监听/克隆。",
+                        f"✅ 扫码登录成功，当前账号：{_current_account_name()}。",
                         buttons=_reply_menu_keyboard(),
                     )
                     qr_states.pop(int(admin_id), None)
@@ -839,7 +1037,7 @@ async def main_async() -> None:
                     await bot_client.send_message(
                         int(chat_id),
                         "⚠️ 二维码已过期，请点击“刷新二维码”。",
-                        buttons=_login_inline_buttons(allow_switch=user_ready),
+                        buttons=_login_inline_buttons(),
                     )
                     qr_states.pop(int(admin_id), None)
                 except asyncio.CancelledError:
@@ -850,7 +1048,7 @@ async def main_async() -> None:
                     await bot_client.send_message(
                         int(chat_id),
                         f"❌ 扫码登录失败：{e}",
-                        buttons=_login_inline_buttons(allow_switch=user_ready),
+                        buttons=_login_inline_buttons(),
                     )
                     qr_states.pop(int(admin_id), None)
 
@@ -860,13 +1058,13 @@ async def main_async() -> None:
     async def _notify_need_login(event, *, alert: bool = False) -> None:
         try:
             if hasattr(event, "answer"):
-                await event.answer("账号未登录，请先扫码登录", alert=alert)
+                await event.answer("当前账号未登录，请先扫码或手机号登录", alert=alert)
         except Exception:
             pass
         try:
             await event.reply(
-                "账号未登录，请先扫码登录。",
-                buttons=_login_inline_buttons(),
+                f"当前账号未登录：{_current_account_name()}。\n请先扫码登录或使用手机号验证码登录。",
+                buttons=_login_inline_buttons(can_refresh=False),
             )
         except Exception:
             pass
@@ -887,8 +1085,8 @@ async def main_async() -> None:
 
     if not user_ready:
         await _notify_admins(
-            "⚠️ 未检测到用户会话，请在 Bot 中扫码登录。",
-            buttons=_login_inline_buttons(),
+            f"⚠️ 当前账号未登录：{_current_account_name()}。\n请在 Bot 中扫码登录或使用手机号验证码登录。",
+            buttons=_login_inline_buttons(can_refresh=False),
         )
         session_offline_notified = True
 
@@ -955,6 +1153,11 @@ async def main_async() -> None:
     def _build_status_text() -> str:
         sources_all = db.list_download_sources(active_only=False)
         sources_active = db.list_download_sources(active_only=True)
+        accounts = []
+        try:
+            accounts = db.list_tg_accounts()
+        except Exception:
+            accounts = []
         forum_groups = []
         try:
             forum_groups = db.list_forum_groups()
@@ -997,7 +1200,9 @@ async def main_async() -> None:
 
         lines: List[str] = [
             "📈 状态",
-            f"- 账号：{'已登录' if user_ready else '未登录'}",
+            f"- 当前账号：{_current_account_name()}",
+            f"- 账号状态：{'已登录' if user_ready else '未登录'}",
+            f"- 已保存账号：{len(accounts)}",
             f"- 来源：{len(sources_all)}（启用 {len(sources_active)}）",
             f"- 超级群组记录：{len(forum_groups)}",
             f"- 已下载媒体组：{total_downloaded}（失败 {total_failed}）",
@@ -1014,6 +1219,102 @@ async def main_async() -> None:
             lines.append("- 当前无克隆任务")
 
         return "\n".join(lines)
+
+    def _build_account_menu_text(extra: Optional[str] = None) -> str:
+        accounts = db.list_tg_accounts()
+        lines: List[str] = [
+            "👤 账号管理",
+            f"- 当前激活账号：{_current_account_name()}",
+            f"- 当前状态：{'已登录' if user_ready else '未登录'}",
+            f"- 已保存账号：{len(accounts)}",
+            "",
+            "账号列表：",
+        ]
+        for account in accounts:
+            name = _build_account_label(
+                label=account.get("label"),
+                phone=account.get("phone"),
+                username=account.get("username"),
+                user_id=int(account.get("user_id") or 0) or None,
+            )
+            status_text = "已登录" if str(account.get("status") or "") == "ready" else "未登录"
+            tail = str(account.get("phone") or "").strip()
+            if not tail:
+                username = str(account.get("username") or "").strip()
+                tail = f"@{username}" if username else str(account.get("session_name") or "")
+            prefix = "👉" if bool(account.get("is_active")) else "  "
+            lines.append(f"{prefix} [{int(account['id'])}] {name} | {status_text} | {tail}")
+            message = str(account.get("status_message") or "").strip()
+            if message:
+                lines.append(f"    {message}")
+        lines.append("")
+        if extra:
+            lines.append(extra)
+        elif user_ready:
+            lines.append("如需登录新账号，请先点击“新建账号”，再对当前激活账号执行登录。")
+        else:
+            lines.append("当前激活账号未登录，可直接使用下方按钮完成登录。")
+        return "\n".join(lines)
+
+    def _build_account_menu_buttons() -> List[List[Button]]:
+        rows: List[List[Button]] = [
+            [Button.inline("🔄 刷新", b"acct:menu"), Button.inline("➕ 新建账号", b"acct:new")],
+        ]
+        if not user_ready:
+            rows.append(
+                [
+                    Button.inline("🔳 扫码登录当前账号", b"login:qr"),
+                    Button.inline("📱 手机号登录当前账号", b"login:phone"),
+                ]
+            )
+        else:
+            rows.append([Button.inline("📌 当前账号已登录", b"acct:noop")])
+
+        for account in db.list_tg_accounts():
+            name = _truncate_button_text(
+                _build_account_label(
+                    label=account.get("label"),
+                    phone=account.get("phone"),
+                    username=account.get("username"),
+                    user_id=int(account.get("user_id") or 0) or None,
+                ),
+                18,
+            )
+            account_id = int(account["id"])
+            if bool(account.get("is_active")):
+                rows.append([Button.inline(f"👉 当前：{name}", b"acct:noop")])
+            else:
+                rows.append(
+                    [
+                        Button.inline(f"切换：{name}", f"acct:switch:{account_id}".encode("utf-8")),
+                        Button.inline(f"删除：{name}", f"acct:delask:{account_id}".encode("utf-8")),
+                    ]
+                )
+
+        rows.append([Button.inline("返回菜单", b"acct:close")])
+        return rows
+
+    async def _show_account_menu(event, *, extra: Optional[str] = None, edit: bool = False) -> None:
+        text = _build_account_menu_text(extra=extra)
+        buttons = _build_account_menu_buttons()
+        if edit and hasattr(event, "edit"):
+            try:
+                await event.edit(text, buttons=buttons)
+                return
+            except MessageNotModifiedError:
+                return
+            except ReplyMarkupInvalidError:
+                try:
+                    await event.edit(text)
+                    return
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        try:
+            await event.reply(text, buttons=buttons)
+        except ReplyMarkupInvalidError:
+            await event.reply(text)
 
     async def _run_clone_with_progress(
         chat_id: int,
@@ -1262,15 +1563,135 @@ async def main_async() -> None:
             action = data.decode("utf-8", errors="ignore").split(":")[1] if b":" in data else ""
             if action in {"qr", "refresh"}:
                 await event.answer("正在生成二维码…")
-                await _start_qr_login(int(user_id), int(event.chat_id))
+                await _start_qr_login(int(user_id), int(event.chat_id), force=(action == "refresh"))
                 return
-            if action == "switch":
-                await event.answer("正在切换账号…")
-                await _start_qr_login(int(user_id), int(event.chat_id), force=True)
+            if action == "phone":
+                if user_ready:
+                    await event.answer("当前激活账号已登录，如需登录新账号请先新建并切换。", alert=True)
+                    return
+                pending[user_id] = PendingTextInput(kind="acct_phone")
+                await event.answer("请发送手机号")
+                await bot_client.send_message(
+                    int(event.chat_id),
+                    f"📱 当前激活账号：{_current_account_name()}\n"
+                    "请发送手机号。\n"
+                    "可选备注名可用“|”分隔，例如：\n"
+                    "+8613812345678 | 我的备用号",
+                    buttons=_reply_menu_keyboard(),
+                )
                 return
             if action == "cancel":
                 await _cancel_qr_state(int(user_id))
                 await event.answer("已取消")
+                return
+            await event.answer("无效操作", alert=True)
+            return
+
+        if data.startswith(b"acct:"):
+            parts = data.decode("utf-8", errors="ignore").split(":")
+            action = parts[1] if len(parts) > 1 else ""
+
+            if action == "menu":
+                await _show_account_menu(event, edit=True)
+                return
+            if action == "close":
+                await event.answer("已返回菜单")
+                await show_home(event)
+                return
+            if action == "noop":
+                await event.answer("请选择可执行的账号操作")
+                return
+            if action == "new":
+                pending.pop(user_id, None)
+                await _cancel_qr_state(int(user_id))
+                session_name = f"user_account_{int(time.time() * 1000)}"
+                label = f"新账号 {time.strftime('%H:%M:%S')}"
+                account_id = db.create_tg_account(
+                    session_name=session_name,
+                    label=label,
+                    status="new",
+                    status_message="等待登录",
+                )
+                await _switch_active_account(account_id)
+                await event.answer("已创建新账号")
+                await _show_account_menu(
+                    event,
+                    extra="已创建并切换到新账号，请继续扫码登录或使用手机号验证码登录。",
+                    edit=True,
+                )
+                return
+            if action == "switch":
+                if len(parts) < 3 or not parts[2].isdigit():
+                    await event.answer("无效账号", alert=True)
+                    return
+                target_id = int(parts[2])
+                pending.pop(user_id, None)
+                await _cancel_qr_state(int(user_id))
+                ok = await _switch_active_account(target_id)
+                await event.answer("已切换账号")
+                await _show_account_menu(
+                    event,
+                    extra=(
+                        f"已切换到账号：{_current_account_name()}。\n"
+                        + ("该账号已登录，监听/克隆已恢复。" if ok else "该账号尚未登录，请继续完成登录。")
+                    ),
+                    edit=True,
+                )
+                return
+            if action == "delask":
+                if len(parts) < 3 or not parts[2].isdigit():
+                    await event.answer("无效账号", alert=True)
+                    return
+                target = db.get_tg_account(int(parts[2]))
+                if not target:
+                    await event.answer("账号不存在", alert=True)
+                    return
+                if bool(target.get("is_active")):
+                    await event.answer("不能删除当前激活账号，请先切换到其他账号。", alert=True)
+                    return
+                name = _build_account_label(
+                    label=target.get("label"),
+                    phone=target.get("phone"),
+                    username=target.get("username"),
+                    user_id=int(target.get("user_id") or 0) or None,
+                )
+                try:
+                    await event.edit(
+                        f"⚠️ 确认删除账号：{name}\n"
+                        "将删除数据库记录，并尝试删除本地 session 文件。",
+                        buttons=[
+                            [
+                                Button.inline("确认删除", f"acct:delconfirm:{int(target['id'])}".encode("utf-8")),
+                                Button.inline("取消", b"acct:menu"),
+                            ]
+                        ],
+                    )
+                except Exception:
+                    await event.reply("删除确认界面打开失败，请重试。", buttons=_reply_menu_keyboard())
+                return
+            if action == "delconfirm":
+                if len(parts) < 3 or not parts[2].isdigit():
+                    await event.answer("无效账号", alert=True)
+                    return
+                target = db.get_tg_account(int(parts[2]))
+                if not target:
+                    await event.answer("账号不存在", alert=True)
+                    await _show_account_menu(event, edit=True)
+                    return
+                if bool(target.get("is_active")):
+                    await event.answer("不能删除当前激活账号。", alert=True)
+                    await _show_account_menu(event, edit=True)
+                    return
+                name = _build_account_label(
+                    label=target.get("label"),
+                    phone=target.get("phone"),
+                    username=target.get("username"),
+                    user_id=int(target.get("user_id") or 0) or None,
+                )
+                await _delete_account_session_files(str(target.get("session_name") or ""))
+                ok = db.delete_tg_account(int(target["id"]))
+                await event.answer("已删除" if ok else "删除失败")
+                await _show_account_menu(event, extra=f"已删除账号：{name}" if ok else "删除账号失败。", edit=True)
                 return
             await event.answer("无效操作", alert=True)
             return
@@ -1783,9 +2204,9 @@ async def main_async() -> None:
             pending.pop(user_id, None)
             await event.reply(_build_status_text(), buttons=_reply_menu_keyboard())
             return
-        if text == "账号登录":
+        if text in {"账号管理", "账号登录"}:
             pending.pop(user_id, None)
-            await _start_qr_login(int(user_id), int(event.chat_id))
+            await _show_account_menu(event)
             return
         if text == "添加频道":
             pending[user_id] = PendingTextInput(kind="addchannel")
@@ -1815,10 +2236,103 @@ async def main_async() -> None:
                         await user_client.sign_in(password=password)
                         pending.pop(user_id, None)
                         qr_states.pop(int(user_id), None)
-                        await _set_user_ready(True, reason="qr_2fa", notify=True)
-                        await event.reply("✅ 2FA 登录成功，已恢复监听/克隆。", buttons=_reply_menu_keyboard())
+                        await _sync_active_account_profile(mark_login=True)
+                        await _set_user_ready(True, reason="qr_2fa", notify=True, force_refresh=True)
+                        await event.reply(
+                            f"✅ 2FA 登录成功，当前账号：{_current_account_name()}。",
+                            buttons=_reply_menu_keyboard(),
+                        )
                     except Exception as e:
                         await event.reply(f"❌ 2FA 登录失败：{e}\n请重新发送密码或重新扫码。", buttons=_reply_menu_keyboard())
+                    return
+
+                if state.kind == "acct_phone":
+                    account_id = int(active_account["id"]) if active_account else 0
+                    raw = (text or "").strip()
+                    phone = raw
+                    custom_label = ""
+                    if "|" in raw:
+                        phone, custom_label = [part.strip() for part in raw.split("|", 1)]
+                    if not phone:
+                        await event.reply("手机号不能为空，请重新发送。", buttons=_reply_menu_keyboard())
+                        return
+                    update_fields = {
+                        "phone": phone,
+                        "status": "pending_code",
+                        "status_message": "验证码已发送，等待输入",
+                    }
+                    if custom_label:
+                        update_fields["label"] = custom_label
+                    db.update_tg_account(account_id, **update_fields)
+                    await _refresh_active_account_from_db()
+                    try:
+                        await _ensure_user_connected()
+                        result = await user_client.send_code_request(phone)
+                        pending[user_id] = PendingTextInput(
+                            kind="acct_code",
+                            payload={"phone": phone, "phone_code_hash": str(result.phone_code_hash or "")},
+                        )
+                        await event.reply(
+                            f"✅ 验证码已发送到：{phone}\n请直接发送验证码。",
+                            buttons=_reply_menu_keyboard(),
+                        )
+                    except Exception as e:
+                        pending.pop(user_id, None)
+                        db.update_tg_account(account_id, status="error", status_message=str(e))
+                        await _refresh_active_account_from_db()
+                        await event.reply(f"❌ 发送验证码失败：{e}", buttons=_reply_menu_keyboard())
+                    return
+
+                if state.kind == "acct_code":
+                    payload = state.payload or {}
+                    phone = str(payload.get("phone") or "").strip()
+                    phone_code_hash = str(payload.get("phone_code_hash") or "").strip()
+                    code = (text or "").strip()
+                    if not phone or not phone_code_hash:
+                        pending.pop(user_id, None)
+                        await event.reply("登录上下文已失效，请重新发起手机号登录。", buttons=_reply_menu_keyboard())
+                        return
+                    if not code:
+                        await event.reply("验证码不能为空，请重新发送。", buttons=_reply_menu_keyboard())
+                        return
+                    try:
+                        await _ensure_user_connected()
+                        await user_client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
+                        pending.pop(user_id, None)
+                        await _sync_active_account_profile(mark_login=True)
+                        await _set_user_ready(True, reason="phone_code", notify=True, force_refresh=True)
+                        await event.reply(
+                            f"✅ 验证码登录成功，当前账号：{_current_account_name()}。",
+                            buttons=_reply_menu_keyboard(),
+                        )
+                    except SessionPasswordNeededError:
+                        pending[user_id] = PendingTextInput(kind="acct_2fa", payload={"phone": phone})
+                        await event.reply("🔐 当前账号启用了 2FA，请直接发送 2FA 密码。", buttons=_reply_menu_keyboard())
+                    except Exception as e:
+                        db.update_tg_account(int(active_account["id"]), status="error", status_message=str(e))
+                        await _refresh_active_account_from_db()
+                        await event.reply(f"❌ 验证码登录失败：{e}", buttons=_reply_menu_keyboard())
+                    return
+
+                if state.kind == "acct_2fa":
+                    password = (text or "").strip()
+                    if not password:
+                        await event.reply("2FA 密码不能为空，请重新发送。", buttons=_reply_menu_keyboard())
+                        return
+                    try:
+                        await _ensure_user_connected()
+                        await user_client.sign_in(password=password)
+                        pending.pop(user_id, None)
+                        await _sync_active_account_profile(mark_login=True)
+                        await _set_user_ready(True, reason="phone_2fa", notify=True, force_refresh=True)
+                        await event.reply(
+                            f"✅ 2FA 登录成功，当前账号：{_current_account_name()}。",
+                            buttons=_reply_menu_keyboard(),
+                        )
+                    except Exception as e:
+                        db.update_tg_account(int(active_account["id"]), status="error", status_message=str(e))
+                        await _refresh_active_account_from_db()
+                        await event.reply(f"❌ 2FA 登录失败：{e}\n请重新发送密码。", buttons=_reply_menu_keyboard())
                     return
 
                 if not user_ready:
