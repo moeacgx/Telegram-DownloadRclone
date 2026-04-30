@@ -403,6 +403,7 @@ def generate_source_list_message(
             Button.inline("⏸️ 全部暂停监听", b"src:alloff"),
         ]
     )
+    buttons.append([Button.inline("🚀 一键补齐并开启全部监听", b"src:bulkresume")])
     buttons.append([Button.inline("🔄 刷新列表", f"src:refresh:{page}".encode("utf-8"))])
     return "\n".join(text_lines).strip(), buttons
 
@@ -570,7 +571,7 @@ def _help_text() -> str:
         "管理方式：\n"
         "- 推荐：使用输入框下方的菜单键盘（/start 或 /menu）\n"
         "- 账号管理：菜单中选择“账号管理”，支持扫码登录、手机号验证码登录、切换账号\n"
-        "- 频道列表里可：暂停/恢复监听、一键开启全部监听、点击“克隆”（历史下载），克隆完成自动切换监听\n"
+        "- 频道列表里可：暂停/恢复监听、一键开启全部监听、一键补齐并开启全部监听、点击“克隆”（历史下载），克隆完成自动切换监听\n"
         "- 超级群组列表：保存群组快捷记录，一键重新拉取话题并选择加入工作列表\n"
         "- 兼容：仍支持文本命令（不推荐）\n"
         "\n"
@@ -754,6 +755,17 @@ async def main_async() -> None:
         runtime_started = True
 
     upload_tasks: Dict[int, asyncio.Task] = {}
+    bulk_resume_task: Optional[asyncio.Task] = None
+    bulk_resume_state: Dict[str, Any] = {
+        "running": False,
+        "done": 0,
+        "total": 0,
+        "success": 0,
+        "skipped": 0,
+        "failed": 0,
+        "current_title": "",
+        "started_at": 0.0,
+    }
 
     pending: Dict[int, PendingState] = {}
     topic_page_size = int(_env_int("BOT_TOPIC_PAGE_SIZE", 10) or 10)
@@ -1218,6 +1230,14 @@ async def main_async() -> None:
         ]
         if upload_q is not None:
             lines.append(f"- 待上传队列：{upload_q}")
+        if bool(bulk_resume_state.get("running")):
+            lines.append(
+                "- 批量补齐：进行中 "
+                f"({int(bulk_resume_state.get('done') or 0)}/{int(bulk_resume_state.get('total') or 0)})"
+            )
+            current_title = str(bulk_resume_state.get("current_title") or "").strip()
+            if current_title:
+                lines.append(f"- 当前处理：{current_title}")
         if cloning_lines:
             lines.append("")
             lines.append("📦 正在克隆：")
@@ -1324,6 +1344,186 @@ async def main_async() -> None:
             await event.reply(text, buttons=buttons)
         except ReplyMarkupInvalidError:
             await event.reply(text)
+
+    def _build_bulk_resume_text(*, title: str, done: int, total: int, success: int, skipped: int, failed: int) -> str:
+        lines = [
+            "🚀 一键补齐并开启全部监听",
+            f"进度：{done}/{total}",
+            f"成功：{success}  跳过：{skipped}  失败：{failed}",
+        ]
+        current = (title or "").strip()
+        if current:
+            lines.append(f"当前：{current}")
+        return "\n".join(lines)
+
+    async def _edit_message_safe(chat_id: int, message_id: int, text: str) -> None:
+        try:
+            await bot_client.edit_message(int(chat_id), int(message_id), text, buttons=_reply_menu_keyboard())
+        except MessageNotModifiedError:
+            return
+        except ReplyMarkupInvalidError:
+            try:
+                await bot_client.edit_message(int(chat_id), int(message_id), text)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    async def _run_bulk_resume_and_listen(chat_id: int) -> None:
+        nonlocal bulk_resume_task
+        sources = db.list_download_sources(active_only=False)
+        if not sources:
+            await bot_client.send_message(int(chat_id), "📭 当前没有任何来源，无需补齐。", buttons=_reply_menu_keyboard())
+            bulk_resume_state.update(
+                {
+                    "running": False,
+                    "done": 0,
+                    "total": 0,
+                    "success": 0,
+                    "skipped": 0,
+                    "failed": 0,
+                    "current_title": "",
+                    "started_at": 0.0,
+                }
+            )
+            bulk_resume_task = None
+            return
+
+        changed = db.set_all_download_sources_active(True)
+        runtime.refresh_sources_cache(force=True)
+
+        total = len(sources)
+        success = 0
+        skipped = 0
+        failed = 0
+        error_lines: List[str] = []
+        bulk_resume_state.update(
+            {
+                "running": True,
+                "done": 0,
+                "total": total,
+                "success": 0,
+                "skipped": 0,
+                "failed": 0,
+                "current_title": "",
+                "started_at": float(time.time()),
+            }
+        )
+
+        progress_msg = await bot_client.send_message(
+            int(chat_id),
+            _build_bulk_resume_text(
+                title=f"准备开始（已开启全部监听 {changed} 个来源）",
+                done=0,
+                total=total,
+                success=0,
+                skipped=0,
+                failed=0,
+            ),
+            buttons=_reply_menu_keyboard(),
+        )
+
+        try:
+            for idx, source in enumerate(sources, start=1):
+                source_id = int(source["id"])
+                title = str(source.get("display_title") or f"source_{source_id}")
+                bulk_resume_state["current_title"] = title
+
+                if runtime.is_cloning(source_id):
+                    skipped += 1
+                    bulk_resume_state.update(
+                        {
+                            "done": idx,
+                            "success": success,
+                            "skipped": skipped,
+                            "failed": failed,
+                        }
+                    )
+                    await _edit_message_safe(
+                        int(chat_id),
+                        int(progress_msg.id),
+                        _build_bulk_resume_text(
+                            title=f"{title}（跳过，已在克隆中）",
+                            done=idx,
+                            total=total,
+                            success=success,
+                            skipped=skipped,
+                            failed=failed,
+                        ),
+                    )
+                    continue
+
+                await _edit_message_safe(
+                    int(chat_id),
+                    int(progress_msg.id),
+                    _build_bulk_resume_text(
+                        title=f"{title}（开始补齐）",
+                        done=idx - 1,
+                        total=total,
+                        success=success,
+                        skipped=skipped,
+                        failed=failed,
+                    ),
+                )
+                try:
+                    task = runtime.start_clone(source_id, auto_listen=True)
+                    await task
+                    success += 1
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    failed += 1
+                    if len(error_lines) < 5:
+                        error_lines.append(f"- {title}: {e}")
+                finally:
+                    bulk_resume_state.update(
+                        {
+                            "done": idx,
+                            "success": success,
+                            "skipped": skipped,
+                            "failed": failed,
+                        }
+                    )
+                    await _edit_message_safe(
+                        int(chat_id),
+                        int(progress_msg.id),
+                        _build_bulk_resume_text(
+                            title=title,
+                            done=idx,
+                            total=total,
+                            success=success,
+                            skipped=skipped,
+                            failed=failed,
+                        ),
+                    )
+
+            final_lines = [
+                "✅ 一键补齐并开启全部监听完成",
+                f"总数：{total}",
+                f"成功：{success}",
+                f"跳过：{skipped}",
+                f"失败：{failed}",
+            ]
+            if error_lines:
+                final_lines.append("")
+                final_lines.append("失败示例：")
+                final_lines.extend(error_lines)
+            await _edit_message_safe(int(chat_id), int(progress_msg.id), "\n".join(final_lines))
+        except asyncio.CancelledError:
+            await _edit_message_safe(
+                int(chat_id),
+                int(progress_msg.id),
+                "⏹️ 一键补齐并开启全部监听已取消。",
+            )
+            raise
+        finally:
+            bulk_resume_state.update(
+                {
+                    "running": False,
+                    "current_title": "",
+                }
+            )
+            bulk_resume_task = None
 
     async def _run_clone_with_progress(
         chat_id: int,
@@ -1559,6 +1759,7 @@ async def main_async() -> None:
 
     @bot_client.on(events.CallbackQuery)
     async def on_callback(event):
+        nonlocal bulk_resume_task
         if not is_admin(event.sender_id):
             await event.answer("无权限", alert=True)
             return
@@ -1761,6 +1962,15 @@ async def main_async() -> None:
                 changed = db.set_all_download_sources_active(False)
                 runtime.refresh_sources_cache(force=True)
                 await event.answer(f"已暂停全部监听（{changed} 个来源）")
+                await _refresh()
+                return
+
+            if action == "bulkresume":
+                if bulk_resume_task and not bulk_resume_task.done():
+                    await event.answer("批量补齐任务已在运行中，请等待当前任务完成。", alert=True)
+                    return
+                await event.answer("已开始后台批量补齐…")
+                bulk_resume_task = asyncio.create_task(_run_bulk_resume_and_listen(int(event.chat_id)))
                 await _refresh()
                 return
 
@@ -2597,6 +2807,12 @@ async def main_async() -> None:
         try:
             watchdog_task.cancel()
             await watchdog_task
+        except Exception:
+            pass
+        try:
+            if bulk_resume_task and (not bulk_resume_task.done()):
+                bulk_resume_task.cancel()
+                await bulk_resume_task
         except Exception:
             pass
         await runtime.stop()
